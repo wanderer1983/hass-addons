@@ -4,840 +4,800 @@ const EventEmitter = require('events');
 const store = require("./store");
 const { TTLockClient, AudioManage, LockedStatus, LogOperateCategory, LogOperateNames } = require("ttlock-sdk-js");
 
-const ScanType = Object.freeze({
-  NONE: 0,
-  AUTOMATIC: 1,
-  MANUAL: 2
-});
-
-const SCAN_MAX = 3;
+const RSSI_STALENESS_MS = 120_000; // drop RSSI reading after 2 minutes
+const PROXY_TIMEOUT_MS = 60_000; // proxy considered dead after 60s no activity
 
 /**
- * Sleep for
- * @param ms miliseconds
+ * Sleep for ms milliseconds
+ * @param {number} ms
  */
 async function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
 /**
  * Events:
- * - lockListChanged - when a lock was found during scanning
- * - lockPaired - a lock was paired
- * - lockConnected - a connetion to a lock was estabilisehed
- * - lockLock - a lock was locked
- * - lockUnlock - a lock was unlocked
- * - scanStart - scanning has started
- * - scanStop - scanning has stopped
+ * - lockListChanged     - a lock was found / list changed
+ * - lockPaired          - a lock was paired
+ * - lockConnected       - a connection to a lock was established
+ * - lockLock            - a lock was locked
+ * - lockUnlock          - a lock was unlocked
+ * - scanStart           - scanning has started
+ * - scanStop            - scanning has stopped
  */
 class Manager extends EventEmitter {
-  constructor() {
-    super();
-    this.startupStatus = -1;
-    this.client = undefined;
-    this.scanning = false;
-    /** @type {NodeJS.Timeout} */
-    this.scanTimer = undefined;
-    this.scanCounter = 0;
-    /** @type {Map<string, import('ttlock-sdk-js').TTLock>} Locks that are paired and were seen during the BLE scan */
-    this.pairedLocks = new Map();
-    /** @type {Map<string, import('ttlock-sdk-js').TTLock>} Locks that are pairable and were seen during the BLE scan */
-    this.newLocks = new Map();
-    /** @type {Set<string>} Locks found during scan that we need to connect to at least once to get their information */
-    this.connectQueue = new Set();
-    /** @type {'none'|'noble'} */
-    this.gateway = 'none';
-    this.gateway_host = "";
-    this.gateway_port = 0;
-    this.gateway_key = "";
-    this.gateway_user = "";
-    this.gateway_pass = "";
-  }
+    constructor() {
+        super();
+        this.startupStatus = -1;
 
-  async init() {
-    if (typeof this.client == "undefined") {
-      try {
-          this.client = [];
+        /**
+         * Array of proxy entries, one per gateway_host value.
+         * Each entry: { id: string, client: TTLockClient, lastSeen: number }
+         * @type {Array<{ id: string, client: TTLockClient, lastSeen: number }>}
+         */
+        this.proxies = [];
 
-          var str_array = this.gateway_host.split(',');
-          for (const element of str_array) {
+        this.scanning = false;
+        /** @type {NodeJS.Timeout} */
+        this.scanTimer = undefined;
 
-              let clientOptions = {}
-              if (this.gateway == "noble") {
-                  clientOptions.scannerType = "noble-websocket";
-                  clientOptions.scannerOptions = {
-                      websocketHost: element,
-                      websocketPort: this.gateway_port,
-                      websocketAesKey: this.gateway_key,
-                      websocketUsername: this.gateway_user,
-                      websocketPassword: this.gateway_pass
-                  }
-              }
-              var client = new TTLockClient(clientOptions);
-              this.client.push(client);
-              this.updateClientLockDataFromStore();
+        /**
+         * Paired locks visible during scan.
+         * @type {Map<string, import('ttlock-sdk-js').TTLock>}
+         */
+        this.pairedLocks = new Map();
 
-              client.on("ready", () => {
-                  // should not trigger if prepareBTService emits it
-                  // but useful for when websocket reconnects
-                  // disable it for now as the reconnection won't re-trigger ready
-                  // this.startScan(ScanType.AUTOMATIC);
-                  client.startMonitor();
-              });
-              client.on("foundLock", this._onFoundLock.bind(this));
-              client.on("scanStart", this._onScanStarted.bind(this));
-              client.on("scanStop", this._onScanStopped.bind(this));
-              client.on("monitorStart", () => console.log("Monitor started"));
-              client.on("monitorStop", () => console.log("Monitor stopped"));
-              client.on("updatedLockData", this._onUpdatedLockData.bind(this));
-              const adapterReady = await client.prepareBTService();
-              if (adapterReady) {
-                  this.startupStatus = 0;
-              } else {
-                  this.startupStatus = 1;
-              }
-          };
-      } catch (error) {
-        console.log(error);
-        this.startupStatus = 1;
-      }
+        /**
+         * New (unpaired) locks visible during scan.
+         * @type {Map<string, import('ttlock-sdk-js').TTLock>}
+         */
+        this.newLocks = new Map();
+
+        /**
+         * Locks we need to connect to at least once after scan stops.
+         * @type {Set<string>}
+         */
+        this.connectQueue = new Set();
+
+        /**
+         * RSSI table: lockAddress -> Array<{ proxyId, rssi, lastSeen }>
+         * Updated every time any proxy advertises a lock.
+         * @type {Map<string, Array<{ proxyId: string, rssi: number, lastSeen: number }>>}
+         */
+        this.lockRssiMap = new Map();
+
+        /**
+         * Maps lockAddress -> proxyId of the proxy that currently owns this lock object.
+         * A lock object is bound to the scanner that found it, so commands must go
+         * through that same client. This lets us find the right client for a given lock.
+         * @type {Map<string, string>}
+         */
+        this.lockOwnerMap = new Map();
+
+        /** @type {'none'|'noble'} */
+        this.gateway = 'none';
+        this.gateway_host = "";
+        this.gateway_port = 0;
+        this.gateway_key = "";
+        this.gateway_user = "";
+        this.gateway_pass = "";
+
+        // Periodically prune stale RSSI entries
+        this._pruneInterval = setInterval(() => this._pruneStaleRssi(), 30_000);
     }
-  }
 
-  updateClientLockDataFromStore() {
-      const lockData = store.getLockData();
-      this.client.forEach((element) => element.setLockData(lockData));
-  }
+    async init() {
+        if (this.proxies.length === 0) {
+            try {
+                const hosts = this.gateway === "noble"
+                    ? this.gateway_host.split(',').map(h => h.trim()).filter(Boolean)
+                    : ["local"];
 
-  setNobleGateway(gateway_host, gateway_port, gateway_key, gateway_user, gateway_pass) {
-    this.gateway = "noble";
-    this.gateway_host = gateway_host;
-    this.gateway_port = gateway_port;
-    this.gateway_key = gateway_key;
-    this.gateway_user = gateway_user;
-    this.gateway_pass = gateway_pass;
-  }
+                for (const host of hosts) {
+                    let clientOptions = {};
+                    if (this.gateway === "noble") {
+                        clientOptions.scannerType = "noble-websocket";
+                        clientOptions.scannerOptions = {
+                            websocketHost: host,
+                            websocketPort: this.gateway_port,
+                            websocketAesKey: this.gateway_key,
+                            websocketUsername: this.gateway_user,
+                            websocketPassword: this.gateway_pass
+                        };
+                    }
 
-  getStartupStatus() {
-    return this.startupStatus;
-  }
+                    const proxyId = host;
+                    const client = new TTLockClient(clientOptions);
+                    const proxy = { id: proxyId, client, lastSeen: Date.now() };
+                    this.proxies.push(proxy);
+
+                    client.setLockData(store.getLockData());
+
+                    client.on("ready", () => {
+                        proxy.lastSeen = Date.now();
+                        client.startMonitor();
+                    });
+
+                    // Capture proxyId in closure — critical so each client knows who it is
+                    client.on("foundLock", (lock) => {
+                        proxy.lastSeen = Date.now();
+                        this._onFoundLock(lock, proxyId);
+                    });
+
+                    client.on("scanStart", () => { proxy.lastSeen = Date.now(); this._onScanStarted(); });
+                    client.on("scanStop", () => { proxy.lastSeen = Date.now(); this._onScanStopped(); });
+                    client.on("monitorStart", () => { proxy.lastSeen = Date.now(); console.log(`[${proxyId}] Monitor started`); });
+                    client.on("monitorStop", () => console.log(`[${proxyId}] Monitor stopped`));
+                    client.on("updatedLockData", this._onUpdatedLockData.bind(this));
+
+                    const adapterReady = await client.prepareBTService();
+                    if (adapterReady) {
+                        this.startupStatus = 0;
+                        console.log(`[${proxyId}] BT adapter ready`);
+                    } else {
+                        this.startupStatus = 1;
+                        console.error(`[${proxyId}] BT adapter NOT ready`);
+                    }
+                }
+            } catch (error) {
+                console.error(error);
+                this.startupStatus = 1;
+            }
+        }
+    }
+
+    updateClientLockDataFromStore() {
+        const lockData = store.getLockData();
+        this.proxies.forEach(p => p.client.setLockData(lockData));
+    }
+
+    setNobleGateway(gateway_host, gateway_port, gateway_key, gateway_user, gateway_pass) {
+        this.gateway = "noble";
+        this.gateway_host = gateway_host;
+        this.gateway_port = gateway_port;
+        this.gateway_key = gateway_key;
+        this.gateway_user = gateway_user;
+        this.gateway_pass = gateway_pass;
+    }
+
+    getStartupStatus() { return this.startupStatus; }
+    getIsScanning() { return this.scanning; }
+    getPairedVisible() { return this.pairedLocks; }
+    getNewVisible() { return this.newLocks; }
+
+    /** Returns proxy/RSSI status per lock — useful for debugging and the UI */
+    getProxyStatus() {
+        const now = Date.now();
+        const proxies = this.proxies.map(p => ({
+            id: p.id,
+            alive: now - p.lastSeen < PROXY_TIMEOUT_MS,
+            lastSeenMs: now - p.lastSeen
+        }));
+        const locks = {};
+        for (const [addr, entries] of this.lockRssiMap) {
+            locks[addr] = {
+                ownerProxy: this.lockOwnerMap.get(addr),
+                seenBy: entries.map(e => ({
+                    proxyId: e.proxyId,
+                    rssi: e.rssi,
+                    staleMs: now - e.lastSeen,
+                    fresh: now - e.lastSeen < RSSI_STALENESS_MS
+                }))
+            };
+        }
+        return { proxies, locks };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scan control
+    // ---------------------------------------------------------------------------
 
     async startScan() {
-        var restotal = false;
-        if (!this.scanning) {
-            for (const element of this.client) {
-                await element.stopMonitor();
-            }
-
-          for (const element of this.client) {
-              const res = await element.startScanLock()
-              if (res == true) {
-                  this._scanTimer();
-                  restotal = true;
-              }
-          };
+        if (this.scanning) return false;
+        for (const p of this.proxies) await p.client.stopMonitor();
+        let anyStarted = false;
+        for (const p of this.proxies) {
+            const res = await p.client.startScanLock();
+            if (res) anyStarted = true;
+        }
+        if (anyStarted) this._scanTimer();
+        return anyStarted;
     }
-        return restotal;
-  }
 
     async stopScan() {
-        var restotal = false;
-    if (this.scanning) {
-      if (typeof this.scanTimer != "undefined") {
-        clearTimeout(this.scanTimer);
-        this.scanTimer = undefined;
+        if (!this.scanning) return false;
+        if (this.scanTimer) {
+            clearTimeout(this.scanTimer);
+            this.scanTimer = undefined;
         }
-        for (const element of this.client) {
-            const res = await element.stopScanLock()
-            if (res == true) {
-                restotal = true;
+        let anyStopped = false;
+        for (const p of this.proxies) {
+            const res = await p.client.stopScanLock();
+            if (res) anyStopped = true;
+        }
+        return anyStopped;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Lock operations — all go through _withLock -> _connectLock
+    // ---------------------------------------------------------------------------
+
+    async initLock(address) {
+        const lock = this.newLocks.get(address);
+        if (!lock) return false;
+        if (!(await this._connectLock(lock))) return false;
+        try {
+            const res = await lock.initLock();
+            if (res !== false) {
+                this.pairedLocks.set(lock.getAddress(), lock);
+                this.newLocks.delete(lock.getAddress());
+                this._bindLockEvents(lock);
+                this.emit("lockPaired", lock);
+                return true;
             }
-        };
-    }
-    return restotal;
-  }
-
-  getIsScanning() {
-    return this.scanning;
-  }
-
-  getPairedVisible() {
-    return this.pairedLocks;
-  }
-
-  getNewVisible() {
-    return this.newLocks;
-  }
-
-  /**
-   * Init a new lock
-   * @param {string} address MAC address
-   */
-  async initLock(address) {
-    const lock = this.newLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        let res = await lock.initLock();
-        if (res != false) {
-          this.pairedLocks.set(lock.getAddress(), lock);
-          this.newLocks.delete(lock.getAddress());
-          this._bindLockEvents(lock);
-          this.emit("lockPaired", lock);
-          return true;
+        } catch (error) {
+            console.error(error);
         }
         return false;
-      } catch (error) {
-        console.error(error);
-        return false;
-      }
     }
-    return false;
-  }
 
-  async unlockLock(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.unlock();
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async unlockLock(address) {
+        return this._withLock(address, lock => lock.unlock());
     }
-    return false;
-  }
 
-  async lockLock(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.lock();
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async lockLock(address) {
+        return this._withLock(address, lock => lock.lock());
     }
-    return false;
-  }
 
-  async setAutoLock(address, value) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.setAutoLockTime(value);
-        this.emit("lockUpdated", lock);
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async setAutoLock(address, value) {
+        return this._withLock(address, async (lock) => {
+            const res = await lock.setAutoLockTime(value);
+            this.emit("lockUpdated", lock);
+            return res;
+        });
     }
-    return false;
-  }
 
-  async getCredentials(address) {
-    const passcodes = await this.getPasscodes(address);
-    const cards = await this.getCards(address);
-    const fingers = await this.getFingers(address);
-    return {
-      passcodes: passcodes,
-      cards: cards,
-      fingers: fingers
-    };
-  }
-
-  async addPasscode(address, type, passCode, startDate, endDate) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasPassCode()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.addPassCode(type, passCode, startDate, endDate);
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async getCredentials(address) {
+        const [passcodes, cards, fingers] = await Promise.all([
+            this.getPasscodes(address),
+            this.getCards(address),
+            this.getFingers(address)
+        ]);
+        return { passcodes, cards, fingers };
     }
-    return false;
-  }
 
-  async updatePasscode(address, type, oldPasscode, newPasscode, startDate, endDate) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasPassCode()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.updatePassCode(type, oldPasscode, newPasscode, startDate, endDate);
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async addPasscode(address, type, passCode, startDate, endDate) {
+        if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
+        return this._withLock(address, lock => lock.addPassCode(type, passCode, startDate, endDate));
     }
-    return false;
-  }
 
-  async deletePasscode(address, type, passCode) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasPassCode()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const res = await lock.deletePassCode(type, passCode);
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async updatePasscode(address, type, oldPasscode, newPasscode, startDate, endDate) {
+        if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
+        return this._withLock(address, lock => lock.updatePassCode(type, oldPasscode, newPasscode, startDate, endDate));
     }
-    return false;
-  }
 
-  async getPasscodes(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasPassCode()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const passcodes = await lock.getPassCodes();
-        return passcodes;
-      } catch (error) {
-        console.error(error);
-      }
+    async deletePasscode(address, type, passCode) {
+        if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
+        return this._withLock(address, lock => lock.deletePassCode(type, passCode));
     }
-    return false;
-  }
 
-  async addCard(address, startDate, endDate, alias) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasICCard()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const card = await lock.addICCard(startDate, endDate);
-        store.setCardAlias(card, alias);
-        return card;
-      } catch (error) {
-        console.error(error);
-      }
+    async getPasscodes(address) {
+        if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
+        return this._withLock(address, lock => lock.getPassCodes());
     }
-    return false;
-  }
 
-  async updateCard(address, card, startDate, endDate, alias) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasICCard()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const result = await lock.updateICCard(card, startDate, endDate);
-        store.setCardAlias(card, alias);
-        return result;
-      } catch (error) {
-        console.error(error);
-      }
+    async addCard(address, startDate, endDate, alias) {
+        if (!this.pairedLocks.get(address)?.hasICCard()) return false;
+        return this._withLock(address, async (lock) => {
+            const card = await lock.addICCard(startDate, endDate);
+            store.setCardAlias(card, alias);
+            return card;
+        });
     }
-    return false;
-  }
 
-  async deleteCard(address, card) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasICCard()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const result = await lock.deleteICCard(card);
-        store.deleteCardAlias(card);
-        return result;
-      } catch (error) {
-        console.error(error);
-      }
+    async updateCard(address, card, startDate, endDate, alias) {
+        if (!this.pairedLocks.get(address)?.hasICCard()) return false;
+        return this._withLock(address, async (lock) => {
+            const result = await lock.updateICCard(card, startDate, endDate);
+            store.setCardAlias(card, alias);
+            return result;
+        });
     }
-    return false;
-  }
 
-  async getCards(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasICCard()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        let cards = await lock.getICCards();
-        if (cards.length > 0) {
-          for (let card of cards) {
-            card.alias = store.getCardAlias(card.cardNumber);
-          }
-        }
-        return cards;
-      } catch (error) {
-        console.error(error);
-      }
+    async deleteCard(address, card) {
+        if (!this.pairedLocks.get(address)?.hasICCard()) return false;
+        return this._withLock(address, async (lock) => {
+            const result = await lock.deleteICCard(card);
+            store.deleteCardAlias(card);
+            return result;
+        });
     }
-    return false;
-  }
 
-  async addFinger(address, startDate, endDate, alias) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasFingerprint()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const finger = await lock.addFingerprint(startDate, endDate);
-        store.setFingerAlias(finger, alias);
-        return finger;
-      } catch (error) {
-        console.error(error);
-      }
+    async getCards(address) {
+        if (!this.pairedLocks.get(address)?.hasICCard()) return false;
+        return this._withLock(address, async (lock) => {
+            const cards = await lock.getICCards();
+            for (const card of cards) card.alias = store.getCardAlias(card.cardNumber);
+            return cards;
+        });
     }
-    return false;
-  }
 
-  async updateFinger(address, finger, startDate, endDate, alias) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasFingerprint()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const result = await lock.updateFingerprint(finger, startDate, endDate);
-        store.setFingerAlias(finger, alias);
-        return result;
-      } catch (error) {
-        console.error(error);
-      }
+    async addFinger(address, startDate, endDate, alias) {
+        if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
+        return this._withLock(address, async (lock) => {
+            const finger = await lock.addFingerprint(startDate, endDate);
+            store.setFingerAlias(finger, alias);
+            return finger;
+        });
     }
-    return false;
-  }
 
-  async deleteFinger(address, finger) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasFingerprint()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const result = await lock.deleteFingerprint(finger);
-        store.deleteFingerAlias(finger);
-        return result;
-      } catch (error) {
-        console.error(error);
-      }
+    async updateFinger(address, finger, startDate, endDate, alias) {
+        if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
+        return this._withLock(address, async (lock) => {
+            const result = await lock.updateFingerprint(finger, startDate, endDate);
+            store.setFingerAlias(finger, alias);
+            return result;
+        });
     }
-    return false;
-  }
 
-  async getFingers(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasFingerprint()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        let fingers = await lock.getFingerprints();
-        if (fingers.length > 0) {
-          for (let finger of fingers) {
-            finger.alias = store.getFingerAlias(finger.fpNumber);
-          }
-        }
-        return fingers;
-      } catch (error) {
-        console.error(error);
-      }
+    async deleteFinger(address, finger) {
+        if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
+        return this._withLock(address, async (lock) => {
+            const result = await lock.deleteFingerprint(finger);
+            store.deleteFingerAlias(finger);
+            return result;
+        });
     }
-    return false;
-  }
 
-  async setAudio(address, audio) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!lock.hasLockSound()) {
-        return false;
-      }
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        const sound = audio == true ? AudioManage.TURN_ON : AudioManage.TURN_OFF;
-        const res = await lock.setLockSound(sound);
-        this.emit("lockUpdated", lock);
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
+    async getFingers(address) {
+        if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
+        return this._withLock(address, async (lock) => {
+            const fingers = await lock.getFingerprints();
+            for (const f of fingers) f.alias = store.getFingerAlias(f.fpNumber);
+            return fingers;
+        });
     }
-    return false;
-  }
 
-  async getOperationLog(address, reload) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof reload == "undefined") {
-      reload = false;
+    async setAudio(address, audio) {
+        if (!this.pairedLocks.get(address)?.hasLockSound()) return false;
+        return this._withLock(address, async (lock) => {
+            const sound = audio ? AudioManage.TURN_ON : AudioManage.TURN_OFF;
+            const res = await lock.setLockSound(sound);
+            this.emit("lockUpdated", lock);
+            return res;
+        });
     }
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
-        return false;
-      }
-      try {
-        let operations = JSON.parse(JSON.stringify(await lock.getOperationLog(true, reload)));
-        let validOperations = [];
-        // console.log(operations);
-        for (let operation of operations) {
-          if (operation) {
-            operation.recordTypeName = LogOperateNames[operation.recordType];
-            if (LogOperateCategory.LOCK.includes(operation.recordType)) {
-              operation.recordTypeCategory = "LOCK";
-            } else if (LogOperateCategory.UNLOCK.includes(operation.recordType)) {
-              operation.recordTypeCategory = "UNLOCK";
-            } else if (LogOperateCategory.FAILED.includes(operation.recordType)) {
-              operation.recordTypeCategory = "FAILED";
-            } else {
-              operation.recordTypeCategory = "OTHER";
+
+    async getOperationLog(address, reload = false) {
+        const lock = this.pairedLocks.get(address);
+        if (!lock) return false;
+        if (!(await this._connectLock(lock))) return false;
+        try {
+            let operations = JSON.parse(JSON.stringify(await lock.getOperationLog(true, reload)));
+            const validOperations = [];
+            for (const op of operations) {
+                if (!op) continue;
+                op.recordTypeName = LogOperateNames[op.recordType];
+                if (LogOperateCategory.LOCK.includes(op.recordType)) op.recordTypeCategory = "LOCK";
+                else if (LogOperateCategory.UNLOCK.includes(op.recordType)) op.recordTypeCategory = "UNLOCK";
+                else if (LogOperateCategory.FAILED.includes(op.recordType)) op.recordTypeCategory = "FAILED";
+                else op.recordTypeCategory = "OTHER";
+                if (typeof op.password !== "undefined") {
+                    if (LogOperateCategory.IC.includes(op.recordType)) op.passwordName = store.getCardAlias(op.password);
+                    else if (LogOperateCategory.FR.includes(op.recordType)) op.passwordName = store.getFingerAlias(op.password);
+                }
+                validOperations.push(op);
             }
-            if (typeof operation.password != "undefined") {
-              if (LogOperateCategory.IC.includes(operation.recordType)) {
-                operation.passwordName = store.getCardAlias(operation.password);
-              } else if (LogOperateCategory.FR.includes(operation.recordType)) {
-                operation.passwordName = store.getFingerAlias(operation.password);
-              }
+            return validOperations;
+        } catch (error) {
+            console.error(error);
+            return false;
+        }
+    }
+
+    async resetLock(address) {
+        const lock = this.pairedLocks.get(address);
+        if (!lock) return false;
+        if (!(await this._connectLock(lock))) return false;
+        try {
+            const res = await lock.resetLock();
+            if (res) {
+                lock.removeAllListeners();
+                this.pairedLocks.delete(address);
+                this.lockOwnerMap.delete(address);
+                this.lockRssiMap.delete(address);
+                this.emit("lockListChanged");
             }
-            validOperations.push(operation);
-          }
+            return res;
+        } catch (error) {
+            console.error(error);
         }
-        return validOperations;
-      } catch (error) {
-        console.error(error);
-      }
-    } else {
-      return false;
-    }
-  }
-
-  async resetLock(address) {
-    const lock = this.pairedLocks.get(address);
-    if (typeof lock != "undefined") {
-      if (!(await this._connectLock(lock))) {
         return false;
-      }
-      try {
-        const res = await lock.resetLock();
-        if (res) {
-          lock.removeAllListeners();
-          this.pairedLocks.delete(address);
-          this.emit("lockListChanged");
-        }
-        return res;
-      } catch (error) {
-        console.error(error);
-      }
     }
-    return false;
-  }
 
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   * @param {boolean} readData 
-   */
-  async _connectLock(lock, readData = true) {
-    if (this.scanning) return false;
-    if (!lock.isConnected()) {
-      try {
-        const res = await lock.connect(!readData);
-        if (!res) {
-          console.log("Connect to lock failed", lock.getAddress());
-          return false;
+    // ---------------------------------------------------------------------------
+    // Core routing
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Connect to a lock through the best available proxy.
+     *
+     * Key insight: a TTLock object is internally bound to the TTLockClient
+     * scanner that discovered it — you cannot freely swap scanners on an
+     * existing lock object. The strategy therefore is:
+     *
+     * 1. Build a ranked list of proxies for this lock (by RSSI, best first).
+     * 2. For each proxy in order:
+     *    a. If it's the owning proxy, use the existing lock object directly.
+     *    b. If it's a different proxy, try to get that proxy's version of the
+     *       lock (it may have seen the same physical device in monitor mode),
+     *       then attempt to connect through it and migrate ownership if it works.
+     * 3. First successful connect wins. If all fail, return false.
+     *
+     * @param {import('ttlock-sdk-js').TTLock} lock
+     * @param {boolean} readData
+     * @returns {Promise<boolean>}
+     */
+    async _connectLock(lock, readData = true) {
+        if (this.scanning) return false;
+        if (lock.isConnected()) return true;
+
+        const address = lock.getAddress();
+        const ranked = this._getRankedProxies(address);
+
+        if (ranked.length === 0) {
+            console.error(`[Manager] No proxies available for lock ${address}`);
+            return false;
         }
-      } catch (error) {
-        console.error(error);
+
+        for (const proxy of ranked) {
+            const lockForProxy = this._getLockForProxy(address, proxy.id);
+            if (!lockForProxy) {
+                console.warn(`[Manager] Proxy [${proxy.id}] has no lock object for ${address}, skipping`);
+                continue;
+            }
+
+            try {
+                const rssi = this._getRssi(address, proxy.id);
+                console.log(`[Manager] Attempting connect to ${address} via [${proxy.id}] rssi=${rssi}`);
+                const res = await lockForProxy.connect(!readData);
+                if (res) {
+                    if (lockForProxy !== lock) {
+                        console.log(`[Manager] Migrating ${address} ownership to [${proxy.id}]`);
+                        this._migrateOwnership(address, lockForProxy, proxy.id);
+                    }
+                    console.log(`[Manager] Connected to ${address} via [${proxy.id}]`);
+                    return true;
+                }
+                console.warn(`[Manager] Proxy [${proxy.id}] connect returned false for ${address}`);
+            } catch (error) {
+                console.warn(`[Manager] Proxy [${proxy.id}] failed for ${address}: ${error.message}`);
+            }
+        }
+
+        console.error(`[Manager] All proxies failed for lock ${address}`);
         return false;
-      }
-      return true;
     }
-    return true;
-  }
 
-  async _onScanStarted() {
-    this.scanning = true;
-    console.log("BLE Scan started");
-    this.emit("scanStart");
-  }
+    /**
+     * Returns proxies sorted by RSSI for a lock address, best first.
+     * Falls back to all alive proxies (owner first) if no RSSI data exists.
+     * @param {string} address
+     * @returns {Array<{ id: string, client: TTLockClient, lastSeen: number }>}
+     */
+    _getRankedProxies(address) {
+        const now = Date.now();
+        const isAlive = (p) => now - p.lastSeen < PROXY_TIMEOUT_MS;
 
-  async _onScanStopped() {
-    this.scanning = false;
-    console.log("BLE Scan stopped");
-    console.log("Refreshing paired locks");
-    for (let address of this.connectQueue) {
-      if (this.pairedLocks.has(address)) {
-        let lock = this.pairedLocks.get(address);
-        console.log("Auto connect to", address);
-        const result = await lock.connect();
-        if (result === true) {
-          await lock.disconnect();
-          console.log("Successful connect attempt to paired lock", address);
-          this.connectQueue.delete(address);
+        const rssiEntries = (this.lockRssiMap.get(address) || [])
+            .filter(e => now - e.lastSeen < RSSI_STALENESS_MS)
+            .sort((a, b) => b.rssi - a.rssi);
+
+        if (rssiEntries.length > 0) {
+            const ranked = rssiEntries
+                .map(e => this.proxies.find(p => p.id === e.proxyId))
+                .filter(p => p && isAlive(p));
+            if (ranked.length > 0) return ranked;
+        }
+
+        // No fresh RSSI data — all alive proxies, owner first
+        const ownerProxyId = this.lockOwnerMap.get(address);
+        return this.proxies
+            .filter(isAlive)
+            .sort((a, b) => {
+                if (a.id === ownerProxyId) return -1;
+                if (b.id === ownerProxyId) return 1;
+                return 0;
+            });
+    }
+
+    /**
+     * Get the RSSI value a proxy last reported for a lock.
+     */
+    _getRssi(address, proxyId) {
+        const entries = this.lockRssiMap.get(address) || [];
+        const entry = entries.find(e => e.proxyId === proxyId);
+        return entry ? entry.rssi : null;
+    }
+
+    /**
+     * Get the lock object that belongs to a specific proxy's scanner.
+     *
+     * The owning proxy has the object in pairedLocks/newLocks.
+     * A non-owning proxy may also have a lock object if it saw the same device
+     * during monitor mode — we retrieve it from that client's internal state.
+     *
+     * @param {string} address
+     * @param {string} proxyId
+     * @returns {import('ttlock-sdk-js').TTLock|null}
+     */
+    _getLockForProxy(address, proxyId) {
+        const ownerProxyId = this.lockOwnerMap.get(address);
+
+        // Owning proxy — return the lock object we already track
+        if (proxyId === ownerProxyId) {
+            return this.pairedLocks.get(address) || this.newLocks.get(address) || null;
+        }
+
+        // Non-owning proxy — ask its TTLockClient for any lock it has seen
+        const proxy = this.proxies.find(p => p.id === proxyId);
+        if (!proxy) return null;
+
+        // TTLockClient API: try common shapes for accessing its internal lock list
+        if (typeof proxy.client.getLocks === "function") {
+            const locks = proxy.client.getLocks();
+            return locks.find(l => l.getAddress() === address) || null;
+        }
+        if (proxy.client.pairedLocks instanceof Map) {
+            return proxy.client.pairedLocks.get(address) || null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Transfer ownership of a lock to a new proxy after a successful connect
+     * through a non-owning proxy.
+     * @param {string} address
+     * @param {import('ttlock-sdk-js').TTLock} newLock  - the new proxy's lock object
+     * @param {string} newProxyId
+     */
+    _migrateOwnership(address, newLock, newProxyId) {
+        const oldLock = this.pairedLocks.get(address);
+        if (oldLock) {
+            oldLock.removeAllListeners();
+            this._bindLockEvents(newLock);
+            this.pairedLocks.set(address, newLock);
+        }
+        this.lockOwnerMap.set(address, newProxyId);
+    }
+
+    /**
+     * Generic helper: connect + run action + handle errors.
+     * Re-fetches the lock from pairedLocks after connect in case ownership migrated.
+     */
+    async _withLock(address, action) {
+        const lock = this.pairedLocks.get(address);
+        if (!lock) return false;
+        if (!(await this._connectLock(lock))) return false;
+        try {
+            // Re-fetch in case _connectLock migrated ownership to a different proxy
+            const currentLock = this.pairedLocks.get(address);
+            return await action(currentLock);
+        } catch (error) {
+            console.error(error);
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // RSSI tracking
+    // ---------------------------------------------------------------------------
+
+    _updateRssi(proxyId, address, rssi) {
+        if (!this.lockRssiMap.has(address)) {
+            this.lockRssiMap.set(address, []);
+        }
+        const entries = this.lockRssiMap.get(address);
+        const existing = entries.find(e => e.proxyId === proxyId);
+        if (existing) {
+            existing.rssi = rssi;
+            existing.lastSeen = Date.now();
         } else {
-          console.log("Unsuccessful connect attempt to paired lock", address);
+            entries.push({ proxyId, rssi, lastSeen: Date.now() });
         }
-      }
     }
 
-    this.emit("scanStop");
-      setTimeout(() => {
-          this.client.forEach((element) => {
-              element.startMonitor();
-          });
-    }, 200);
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onFoundLock(lock) {
-    let listChanged = false;
-    if (lock.isPaired()) {
-      // check if lock is known
-      if (!this.pairedLocks.has(lock.getAddress())) {
-        this._bindLockEvents(lock);
-        // add it to the list of known locks and connect it
-          console.log("Discovered paired lock:", lock.getAddress());
-          var result = false;
-          var anymonitoring = false;
-
-          for (const element of this.client) {
-              if (element.isMonitoring()) {
-                  anymonitoring = true;
-                  const result2 = await lock.connect();
-                  if (result2) {
-                      result = result;
-                  }
-              } 
-          };
-          if (anymonitoring) {
-              if (result) {
-                  if (result == true) {
-                      console.log("Successful connect attempt to paired lock", lock.getAddress());
-                      await this._processOperationLog(lock);
-                  } else {
-                      console.log("Unsuccessful connect attempt to paired lock", lock.getAddress());
-                      this.connectQueue.add(lock.getAddress());
-                  }
-              }
-              await lock.disconnect();
-          } else
-          {
-              // add it to the connect queue
-              this.connectQueue.add(lock.getAddress());
-          }
-
-        listChanged = true;
-      }
-    } else if (!lock.isInitialized()) {
-      if (!this.newLocks.has(lock.getAddress())) {
-        // this._bindLockEvents(lock);
-        // check if lock is in pairing mode
-        // add it to the list of new locks, ready to be initialized
-        console.log("Discovered new lock:", lock.toJSON());
-        this.newLocks.set(lock.getAddress(), lock);
-          listChanged = true;
-          for (const element of this.client) {
-              if (element.isScanning()) {
-                  console.log("New lock found, stopping scan");
-                  await this.stopScan();
-              }
-          };
-        
-      }
-    } else {
-      console.log("Discovered unknown lock:", lock.toJSON());
+    _pruneStaleRssi() {
+        const now = Date.now();
+        for (const [addr, entries] of this.lockRssiMap) {
+            const fresh = entries.filter(e => now - e.lastSeen < RSSI_STALENESS_MS);
+            if (fresh.length === 0) this.lockRssiMap.delete(addr);
+            else this.lockRssiMap.set(addr, fresh);
+        }
     }
 
-    if (listChanged) {
-      this.emit("lockListChanged");
+    // ---------------------------------------------------------------------------
+    // Scanner / monitor events
+    // ---------------------------------------------------------------------------
+
+    async _onScanStarted() {
+        this.scanning = true;
+        console.log("BLE Scan started");
+        this.emit("scanStart");
     }
-  }
+
+    async _onScanStopped() {
+        this.scanning = false;
+        console.log("BLE Scan stopped — refreshing paired locks");
+        for (const address of this.connectQueue) {
+            if (this.pairedLocks.has(address)) {
+                const lock = this.pairedLocks.get(address);
+                console.log("Auto connect to", address);
+                const result = await lock.connect();
+                if (result === true) {
+                    await lock.disconnect();
+                    console.log("Successful connect attempt to paired lock", address);
+                    this.connectQueue.delete(address);
+                } else {
+                    console.log("Unsuccessful connect attempt to paired lock", address);
+                }
+            }
+        }
+        this.emit("scanStop");
+        setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 200);
+    }
+
+    /**
+     * Called when any proxy finds a lock during scan or monitor.
+     * @param {import('ttlock-sdk-js').TTLock} lock
+     * @param {string} proxyId  - which proxy found this lock
+     */
+    async _onFoundLock(lock, proxyId) {
+        const address = lock.getAddress();
+
+        // Always update RSSI — this is the core data for routing decisions
+        this._updateRssi(proxyId, address, lock.rssi);
+
+        let listChanged = false;
+
+        if (lock.isPaired()) {
+            if (!this.pairedLocks.has(address)) {
+                // First sighting of this paired lock — record ownership
+                this.lockOwnerMap.set(address, proxyId);
+                this._bindLockEvents(lock);
+                console.log(`Discovered paired lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
+
+                const anyMonitoring = this.proxies.some(p => p.client.isMonitoring());
+                if (anyMonitoring) {
+                    const result = await lock.connect();
+                    if (result === true) {
+                        console.log("Successful connect attempt to paired lock", address);
+                        await this._processOperationLog(lock);
+                    } else {
+                        console.log("Unsuccessful connect attempt to paired lock", address);
+                        this.connectQueue.add(address);
+                    }
+                    await lock.disconnect();
+                } else {
+                    this.connectQueue.add(address);
+                }
+                listChanged = true;
+
+            } else {
+                // Already known — log that another proxy can also see it (useful for debugging)
+                const ownerProxy = this.lockOwnerMap.get(address);
+                if (proxyId !== ownerProxy) {
+                    console.log(`Lock ${address} also seen by proxy [${proxyId}] rssi=${lock.rssi} (owner: [${ownerProxy}])`);
+                }
+            }
+
+        } else if (!lock.isInitialized()) {
+            if (!this.newLocks.has(address)) {
+                this.lockOwnerMap.set(address, proxyId);
+                console.log(`Discovered new lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
+                this.newLocks.set(address, lock);
+                listChanged = true;
+                if (this.proxies.some(p => p.client.isScanning())) {
+                    console.log("New lock found, stopping scan");
+                    await this.stopScan();
+                }
+            }
+        } else {
+            console.log("Discovered unknown lock:", lock.toJSON());
+        }
+
+        if (listChanged) {
+            this.emit("lockListChanged");
+        }
+    }
 
     async _onUpdatedLockData() {
-        var lockdata = new [];
-        this.client.forEach((element) => {
-            lockdata.push(element.getLockData());
-        });
-        store.setLockData(lockdata);
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  _bindLockEvents(lock) {
-    lock.on("connected", this._onLockConnected.bind(this));
-    lock.on("disconnected", this._onLockDisconnected.bind(this));
-    lock.on("locked", this._onLockLocked.bind(this));
-    lock.on("unlocked", this._onLockUnlocked.bind(this));
-    lock.on("updated", this._onLockUpdated.bind(this));
-    lock.on("scanICStart", () => this.emit("lockCardScan", lock));
-    lock.on("scanFRStart", () => this.emit("lockFingerScan", lock));
-    lock.on("scanFRProgress", () => this.emit("lockFingerScanProgress", lock));
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onLockConnected(lock) {
-    if (lock.isPaired()) {
-      this.pairedLocks.set(lock.getAddress(), lock);
-      console.log("Connected to paired lock " + lock.getAddress());
-      this.emit("lockConnected", lock);
-    } else {
-      console.log("Connected to new lock " + lock.getAddress());
-    }
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onLockDisconnected(lock) {
-      console.log("Disconnected from lock " + lock.getAddress());
-      this.client.forEach((element) => element.startMonitor());
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onLockLocked(lock) {
-    this.emit("lockLock", lock);
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onLockUnlocked(lock) {
-    this.emit("lockUnlock", lock);
-  }
-
-  /**
-   * 
-   * @param {import('ttlock-sdk-js').TTLock} lock 
-   */
-  async _onLockUpdated(lock, paramsChanged) {
-    console.log("lockUpdated", paramsChanged);
-    // if lock has new operations read the operations and send updates
-    if (paramsChanged.newEvents == true && lock.hasNewEvents()) {
-      if (!lock.isConnected()) {
-        const result = await lock.connect();
-        // TODO: handle failed connection
-      }
-      await this._processOperationLog(lock);
-    }
-    if (paramsChanged.lockedStatus == true) {
-      const status = await lock.getLockStatus();
-      if (status == LockedStatus.LOCKED) {
-        console.log(">>>>>> Lock is now locked from new event <<<<<<");
-        this.emit("lockLock", lock);
-      }
-    }
-    if (paramsChanged.batteryCapacity == true) {
-      this.emit("lockUpdated", lock);
+        const lockData = [];
+        this.proxies.forEach(p => lockData.push(p.client.getLockData()));
+        store.setLockData(lockData);
     }
 
-    await lock.disconnect();
-  }
+    _bindLockEvents(lock) {
+        lock.on("connected", this._onLockConnected.bind(this));
+        lock.on("disconnected", this._onLockDisconnected.bind(this));
+        lock.on("locked", this._onLockLocked.bind(this));
+        lock.on("unlocked", this._onLockUnlocked.bind(this));
+        lock.on("updated", this._onLockUpdated.bind(this));
+        lock.on("scanICStart", () => this.emit("lockCardScan", lock));
+        lock.on("scanFRStart", () => this.emit("lockFingerScan", lock));
+        lock.on("scanFRProgress", () => this.emit("lockFingerScanProgress", lock));
+    }
 
-  async _processOperationLog(lock) {
-    let operations = await lock.getOperationLog();
-    let lastStatus = LockedStatus.UNKNOWN;
-    for (let op of operations) {
-      if (LogOperateCategory.UNLOCK.includes(op.recordType)) {
-        lastStatus = LockedStatus.UNLOCKED;
-        console.log(">>>>>> Lock was unlocked <<<<<<");
-        this.emit("lockUnlock", lock);
-      } else if (LogOperateCategory.LOCK.includes(op.recordType)) {
-        lastStatus = LockedStatus.LOCKED;
-        console.log(">>>>>> Lock was locked <<<<<<");
-        this.emit("lockLock", lock);
-      }
+    async _onLockConnected(lock) {
+        if (lock.isPaired()) {
+            this.pairedLocks.set(lock.getAddress(), lock);
+            console.log("Connected to paired lock", lock.getAddress());
+            this.emit("lockConnected", lock);
+        } else {
+            console.log("Connected to new lock", lock.getAddress());
+        }
     }
-    const status = await lock.getLockStatus();
-    if (lastStatus != LockedStatus.UNKNOWN && status != lastStatus) {
-      if (status == LockedStatus.LOCKED) {
-        console.log(">>>>>> Lock is now locked <<<<<<");
-        this.emit("lockLock", lock);
-      } else if (status == LockedStatus.UNLOCKED) {
-        console.log(">>>>>> Lock is now unlocked <<<<<<");
-        this.emit("lockUnlock", lock);
-      }
-    }
-  }
 
-  /** Stop scan after 30 seconds */
-  async _scanTimer() {
-    if (typeof this.scanTimer == "undefined") {
-      this.scanTimer = setTimeout(() => {
-        this.stopScan();
-      }, 30 * 1000);
+    async _onLockDisconnected(lock) {
+        console.log("Disconnected from lock", lock.getAddress());
+        this.proxies.forEach(p => p.client.startMonitor());
     }
-  }
+
+    async _onLockLocked(lock) { this.emit("lockLock", lock); }
+    async _onLockUnlocked(lock) { this.emit("lockUnlock", lock); }
+
+    async _onLockUpdated(lock, paramsChanged) {
+        console.log("lockUpdated", paramsChanged);
+        if (paramsChanged.newEvents === true && lock.hasNewEvents()) {
+            if (!lock.isConnected()) await lock.connect();
+            await this._processOperationLog(lock);
+        }
+        if (paramsChanged.lockedStatus === true) {
+            const status = await lock.getLockStatus();
+            if (status === LockedStatus.LOCKED) {
+                console.log(">>>>>> Lock is now locked from new event <<<<<<");
+                this.emit("lockLock", lock);
+            }
+        }
+        if (paramsChanged.batteryCapacity === true) {
+            this.emit("lockUpdated", lock);
+        }
+        await lock.disconnect();
+    }
+
+    async _processOperationLog(lock) {
+        const operations = await lock.getOperationLog();
+        let lastStatus = LockedStatus.UNKNOWN;
+        for (const op of operations) {
+            if (LogOperateCategory.UNLOCK.includes(op.recordType)) {
+                lastStatus = LockedStatus.UNLOCKED;
+                console.log(">>>>>> Lock was unlocked <<<<<<");
+                this.emit("lockUnlock", lock);
+            } else if (LogOperateCategory.LOCK.includes(op.recordType)) {
+                lastStatus = LockedStatus.LOCKED;
+                console.log(">>>>>> Lock was locked <<<<<<");
+                this.emit("lockLock", lock);
+            }
+        }
+        const status = await lock.getLockStatus();
+        if (lastStatus !== LockedStatus.UNKNOWN && status !== lastStatus) {
+            if (status === LockedStatus.LOCKED) {
+                console.log(">>>>>> Lock is now locked <<<<<<");
+                this.emit("lockLock", lock);
+            } else if (status === LockedStatus.UNLOCKED) {
+                console.log(">>>>>> Lock is now unlocked <<<<<<");
+                this.emit("lockUnlock", lock);
+            }
+        }
+    }
+
+    async _scanTimer() {
+        if (!this.scanTimer) {
+            this.scanTimer = setTimeout(() => this.stopScan(), 30 * 1000);
+        }
+    }
 }
 
 const manager = new Manager();
-
 module.exports = manager;
