@@ -704,7 +704,11 @@ class Manager extends EventEmitter {
                 }
             }
         } else {
-            console.log("Discovered unknown lock:", lock.toJSON());
+            try {
+                console.log("Discovered unknown lock:", lock.toJSON());
+            } catch (e) {
+                console.log("Discovered unknown lock:", lock.getAddress(), "(toJSON failed - circular ref)");
+            }
         }
 
         if (listChanged) {
