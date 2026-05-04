@@ -84,6 +84,7 @@ class Manager extends EventEmitter {
 
         // Periodically prune stale RSSI entries
         this._pruneInterval = setInterval(() => this._pruneStaleRssi(), 30_000);
+        this._connecting = new Set();
     }
 
     async init() {
@@ -443,40 +444,50 @@ class Manager extends EventEmitter {
         if (lock.isConnected()) return true;
 
         const address = lock.getAddress();
-        const ranked = this._getRankedProxies(address);
 
-        if (ranked.length === 0) {
-            console.error(`[Manager] No proxies available for lock ${address}`);
+        // Prevent concurrent connect attempts to the same lock
+        if (this._connecting.has(address)) {
+            console.log(`[Manager] Connect already in progress for ${address}, skipping`);
             return false;
         }
+        this._connecting.add(address);
 
-        for (const proxy of ranked) {
-            const lockForProxy = this._getLockForProxy(address, proxy.id);
-            if (!lockForProxy) {
-                console.warn(`[Manager] Proxy [${proxy.id}] has no lock object for ${address}, skipping`);
-                continue;
+        try {
+            const ranked = this._getRankedProxies(address);
+            if (ranked.length === 0) {
+                console.error(`[Manager] No proxies available for lock ${address}`);
+                return false;
             }
 
-            try {
-                const rssi = this._getRssi(address, proxy.id);
-                console.log(`[Manager] Attempting connect to ${address} via [${proxy.id}] rssi=${rssi}`);
-                const res = await lockForProxy.connect(!readData);
-                if (res) {
-                    if (lockForProxy !== lock) {
-                        console.log(`[Manager] Migrating ${address} ownership to [${proxy.id}]`);
-                        this._migrateOwnership(address, lockForProxy, proxy.id);
-                    }
-                    console.log(`[Manager] Connected to ${address} via [${proxy.id}]`);
-                    return true;
+            for (const proxy of ranked) {
+                const lockForProxy = this._getLockForProxy(address, proxy.id);
+                if (!lockForProxy) {
+                    console.warn(`[Manager] Proxy [${proxy.id}] has no lock object for ${address}, skipping`);
+                    continue;
                 }
-                console.warn(`[Manager] Proxy [${proxy.id}] connect returned false for ${address}`);
-            } catch (error) {
-                console.warn(`[Manager] Proxy [${proxy.id}] failed for ${address}: ${error.message}`);
+                try {
+                    const rssi = this._getRssi(address, proxy.id);
+                    console.log(`[Manager] Attempting connect to ${address} via [${proxy.id}] rssi=${rssi}`);
+                    const res = await lockForProxy.connect(!readData);
+                    if (res) {
+                        if (lockForProxy !== lock) {
+                            console.log(`[Manager] Migrating ${address} ownership to [${proxy.id}]`);
+                            this._migrateOwnership(address, lockForProxy, proxy.id);
+                        }
+                        console.log(`[Manager] Connected to ${address} via [${proxy.id}]`);
+                        return true;
+                    }
+                    console.warn(`[Manager] Proxy [${proxy.id}] connect returned false for ${address}`);
+                } catch (error) {
+                    console.warn(`[Manager] Proxy [${proxy.id}] failed for ${address}: ${error.message}`);
+                }
             }
-        }
 
-        console.error(`[Manager] All proxies failed for lock ${address}`);
-        return false;
+            console.error(`[Manager] All proxies failed for lock ${address}`);
+            return false;
+        } finally {
+            this._connecting.delete(address);
+        }
     }
 
     /**
@@ -745,7 +756,9 @@ class Manager extends EventEmitter {
 
     async _onLockDisconnected(lock) {
         console.log("Disconnected from lock", lock.getAddress());
-        this.proxies.forEach(p => p.client.startMonitor());
+        if (lock.isPaired()) {
+            this.proxies.forEach(p => p.client.startMonitor());
+        }
     }
 
     async _onLockLocked(lock) { this.emit("lockLock", lock); }
@@ -754,7 +767,7 @@ class Manager extends EventEmitter {
     async _onLockUpdated(lock, paramsChanged) {
         console.log("lockUpdated", paramsChanged);
         if (paramsChanged.newEvents === true && lock.hasNewEvents()) {
-            if (!lock.isConnected()) await lock.connect();
+            if (!lock.isConnected()) await this._connectLock(lock);
             await this._processOperationLog(lock);
         }
         if (paramsChanged.lockedStatus === true) {
