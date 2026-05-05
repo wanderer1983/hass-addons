@@ -16,14 +16,29 @@ async function sleep(ms) {
 }
 
 /**
+ * Architecture:
+ *
+ * - ONE shared flat lock list (pairedLocks / newLocks) — same format as original,
+ *   saved/loaded to lockData.json exactly as before.
+ *
+ * - Each TTLockClient (proxy) gets the full lock list on startup so it can
+ *   recognise and decrypt advertisements from any lock.
+ *
+ * - An ephemeral RSSI table (never saved) tracks signal strength per lock per proxy.
+ *   Updated whenever any proxy sees a lock advertisement.
+ *
+ * - When a command needs to be sent to a lock, the proxy with the strongest
+ *   recent RSSI for that lock is chosen. If it fails, the next-best is tried.
+ *
+ * - Lock objects: the SDK binds a TTLock object to the scanner that created it,
+ *   so each proxy maintains its own TTLock instances internally. We keep ONE
+ *   canonical TTLock per address in pairedLocks (the one from the first proxy
+ *   that found it) for event binding and state, but when connecting we ask the
+ *   best-proxy's client for its version of the lock.
+ *
  * Events:
- * - lockListChanged     - a lock was found / list changed
- * - lockPaired          - a lock was paired
- * - lockConnected       - a connection to a lock was established
- * - lockLock            - a lock was locked
- * - lockUnlock          - a lock was unlocked
- * - scanStart           - scanning has started
- * - scanStop            - scanning has stopped
+ * - lockListChanged, lockPaired, lockConnected, lockLock, lockUnlock,
+ *   lockUpdated, scanStart, scanStop
  */
 class Manager extends EventEmitter {
     constructor() {
@@ -31,8 +46,8 @@ class Manager extends EventEmitter {
         this.startupStatus = -1;
 
         /**
-         * Array of proxy entries, one per gateway_host value.
-         * Each entry: { id: string, client: TTLockClient, lastSeen: number }
+         * One entry per proxy host.
+         * { id: string, client: TTLockClient, lastSeen: number }
          * @type {Array<{ id: string, client: TTLockClient, lastSeen: number }>}
          */
         this.proxies = [];
@@ -42,37 +57,37 @@ class Manager extends EventEmitter {
         this.scanTimer = undefined;
 
         /**
-         * Paired locks visible during scan.
+         * Canonical paired lock objects — ONE per address, same as original.
+         * Saved/loaded via store exactly as before.
          * @type {Map<string, import('ttlock-sdk-js').TTLock>}
          */
         this.pairedLocks = new Map();
 
         /**
-         * New (unpaired) locks visible during scan.
+         * New (unpaired) locks waiting for user to press Pair.
          * @type {Map<string, import('ttlock-sdk-js').TTLock>}
          */
         this.newLocks = new Map();
 
         /**
-         * Locks we need to connect to at least once after scan stops.
+         * Locks to connect to after scan stops (first-time data read).
          * @type {Set<string>}
          */
         this.connectQueue = new Set();
 
         /**
+         * EPHEMERAL — never saved.
          * RSSI table: lockAddress -> Array<{ proxyId, rssi, lastSeen }>
-         * Updated every time any proxy advertises a lock.
+         * Updated on every advertisement from every proxy.
          * @type {Map<string, Array<{ proxyId: string, rssi: number, lastSeen: number }>>}
          */
         this.lockRssiMap = new Map();
 
         /**
-         * Maps lockAddress -> proxyId of the proxy that currently owns this lock object.
-         * A lock object is bound to the scanner that found it, so commands must go
-         * through that same client. This lets us find the right client for a given lock.
-         * @type {Map<string, string>}
+         * Prevents concurrent connect attempts to the same lock.
+         * @type {Set<string>}
          */
-        this.lockOwnerMap = new Map();
+        this._connecting = new Set();
 
         /** @type {'none'|'noble'} */
         this.gateway = 'none';
@@ -84,7 +99,6 @@ class Manager extends EventEmitter {
 
         // Periodically prune stale RSSI entries
         this._pruneInterval = setInterval(() => this._pruneStaleRssi(), 30_000);
-        this._connecting = new Set();
     }
 
     async init() {
@@ -94,20 +108,26 @@ class Manager extends EventEmitter {
                     ? this.gateway_host.split(',').map(h => h.trim()).filter(Boolean)
                     : ["local"];
 
-                const keys = this.gateway_key.split(',').map(k => k.trim());
+                // Support per-proxy AES keys: gateway_key can be comma-separated.
+                // If fewer keys than hosts, the last key is reused.
+                const keys = this.gateway_key.split(',').map(k => k.trim()).filter(Boolean);
+                const keyFor = (i) => keys[i] || keys[keys.length - 1] || "";
+
                 const ports = this.gateway_port.split(',').map(k => k.trim());
+                const portFor = (i) => ports[i] || ports[ports.length - 1] || "";
+
+                // The shared lock data from store — fed to every proxy client
+                const lockData = store.getLockData();
+
                 for (let i = 0; i < hosts.length; i++) {
                     const host = hosts[i];
-                    const key = keys[i] || keys[0] || this.gateway_key; // fallback to first key if not enough keys
-                    const port = ports[i] || ports[0] || this.gateway_key; // fallback to first port if not enough keys
-
                     let clientOptions = {};
                     if (this.gateway === "noble") {
                         clientOptions.scannerType = "noble-websocket";
                         clientOptions.scannerOptions = {
                             websocketHost: host,
-                            websocketPort: port,
-                            websocketAesKey: key,          // <-- per-proxy key
+                            websocketPort: portFor(i),
+                            websocketAesKey: keyFor(i),
                             websocketUsername: this.gateway_user,
                             websocketPassword: this.gateway_pass
                         };
@@ -118,16 +138,17 @@ class Manager extends EventEmitter {
                     const proxy = { id: proxyId, client, lastSeen: Date.now() };
                     this.proxies.push(proxy);
 
-                    client.setLockData(store.getLockData());
+                    // Give every proxy the full shared lock list
+                    client.setLockData(lockData);
 
                     client.on("ready", () => {
                         proxy.lastSeen = Date.now();
                         client.startMonitor();
                     });
 
-                    // Capture proxyId in closure — critical so each client knows who it is
                     client.on("foundLock", (lock) => {
                         proxy.lastSeen = Date.now();
+                        this._updateRssi(proxyId, lock.getAddress(), lock.rssi);
                         this._onFoundLock(lock, proxyId);
                     });
 
@@ -153,6 +174,10 @@ class Manager extends EventEmitter {
         }
     }
 
+    /**
+     * Push the shared lock list to all proxy clients.
+     * Called after store is updated externally (e.g. config import).
+     */
     updateClientLockDataFromStore() {
         const lockData = store.getLockData();
         this.proxies.forEach(p => p.client.setLockData(lockData));
@@ -172,7 +197,7 @@ class Manager extends EventEmitter {
     getPairedVisible() { return this.pairedLocks; }
     getNewVisible() { return this.newLocks; }
 
-    /** Returns proxy/RSSI status per lock — useful for debugging and the UI */
+    /** Proxy/RSSI debug info */
     getProxyStatus() {
         const now = Date.now();
         const proxies = this.proxies.map(p => ({
@@ -182,15 +207,12 @@ class Manager extends EventEmitter {
         }));
         const locks = {};
         for (const [addr, entries] of this.lockRssiMap) {
-            locks[addr] = {
-                ownerProxy: this.lockOwnerMap.get(addr),
-                seenBy: entries.map(e => ({
-                    proxyId: e.proxyId,
-                    rssi: e.rssi,
-                    staleMs: now - e.lastSeen,
-                    fresh: now - e.lastSeen < RSSI_STALENESS_MS
-                }))
-            };
+            locks[addr] = entries.map(e => ({
+                proxyId: e.proxyId,
+                rssi: e.rssi,
+                staleMs: now - e.lastSeen,
+                fresh: now - e.lastSeen < RSSI_STALENESS_MS
+            }));
         }
         return { proxies, locks };
     }
@@ -204,8 +226,7 @@ class Manager extends EventEmitter {
         for (const p of this.proxies) await p.client.stopMonitor();
         let anyStarted = false;
         for (const p of this.proxies) {
-            const res = await p.client.startScanLock();
-            if (res) anyStarted = true;
+            if (await p.client.startScanLock()) anyStarted = true;
         }
         if (anyStarted) this._scanTimer();
         return anyStarted;
@@ -219,14 +240,13 @@ class Manager extends EventEmitter {
         }
         let anyStopped = false;
         for (const p of this.proxies) {
-            const res = await p.client.stopScanLock();
-            if (res) anyStopped = true;
+            if (await p.client.stopScanLock()) anyStopped = true;
         }
         return anyStopped;
     }
 
     // ---------------------------------------------------------------------------
-    // Lock operations — all go through _withLock -> _connectLock
+    // Lock operations
     // ---------------------------------------------------------------------------
 
     async initLock(address) {
@@ -411,7 +431,6 @@ class Manager extends EventEmitter {
             if (res) {
                 lock.removeAllListeners();
                 this.pairedLocks.delete(address);
-                this.lockOwnerMap.delete(address);
                 this.lockRssiMap.delete(address);
                 this.emit("lockListChanged");
             }
@@ -423,25 +442,19 @@ class Manager extends EventEmitter {
     }
 
     // ---------------------------------------------------------------------------
-    // Core routing
+    // Core routing — connect via best proxy by RSSI
     // ---------------------------------------------------------------------------
 
     /**
-     * Connect to a lock through the best available proxy.
+     * Connect to a lock using the proxy with the strongest recent RSSI.
+     * Falls back through ranked proxies until one succeeds.
      *
-     * Key insight: a TTLock object is internally bound to the TTLockClient
-     * scanner that discovered it — you cannot freely swap scanners on an
-     * existing lock object. The strategy therefore is:
+     * Each proxy client has its own internal TTLock instance for the same
+     * physical lock (because the SDK binds lock objects to their scanner).
+     * We ask each proxy's client for its version of the lock and attempt
+     * to connect through it.
      *
-     * 1. Build a ranked list of proxies for this lock (by RSSI, best first).
-     * 2. For each proxy in order:
-     *    a. If it's the owning proxy, use the existing lock object directly.
-     *    b. If it's a different proxy, try to get that proxy's version of the
-     *       lock (it may have seen the same physical device in monitor mode),
-     *       then attempt to connect through it and migrate ownership if it works.
-     * 3. First successful connect wins. If all fail, return false.
-     *
-     * @param {import('ttlock-sdk-js').TTLock} lock
+     * @param {import('ttlock-sdk-js').TTLock} lock  canonical lock object
      * @param {boolean} readData
      * @returns {Promise<boolean>}
      */
@@ -451,7 +464,7 @@ class Manager extends EventEmitter {
 
         const address = lock.getAddress();
 
-        // Prevent concurrent connect attempts to the same lock
+        // Prevent concurrent connect attempts for the same lock
         if (this._connecting.has(address)) {
             console.log(`[Manager] Connect already in progress for ${address}, skipping`);
             return false;
@@ -466,19 +479,18 @@ class Manager extends EventEmitter {
             }
 
             for (const proxy of ranked) {
-                const lockForProxy = this._getLockForProxy(address, proxy.id);
-                if (!lockForProxy) {
-                    console.warn(`[Manager] Proxy [${proxy.id}] has no lock object for ${address}, skipping`);
-                    continue;
-                }
+                // Get this proxy's internal lock object for this address
+                const proxyLock = this._getProxyLock(proxy, address) || lock;
+
                 try {
                     const rssi = this._getRssi(address, proxy.id);
                     console.log(`[Manager] Attempting connect to ${address} via [${proxy.id}] rssi=${rssi}`);
-                    const res = await lockForProxy.connect(!readData);
+                    const res = await proxyLock.connect(!readData);
                     if (res) {
-                        if (lockForProxy !== lock) {
-                            console.log(`[Manager] Migrating ${address} ownership to [${proxy.id}]`);
-                            this._migrateOwnership(address, lockForProxy, proxy.id);
+                        // If we connected via a different proxy's lock object, update
+                        // our canonical reference so subsequent calls use the right object
+                        if (proxyLock !== lock) {
+                            this._transferCanonical(address, proxyLock);
                         }
                         console.log(`[Manager] Connected to ${address} via [${proxy.id}]`);
                         return true;
@@ -497,110 +509,77 @@ class Manager extends EventEmitter {
     }
 
     /**
-     * Returns proxies sorted by RSSI for a lock address, best first.
-     * Falls back to all alive proxies (owner first) if no RSSI data exists.
-     * @param {string} address
-     * @returns {Array<{ id: string, client: TTLockClient, lastSeen: number }>}
+     * Returns proxies sorted by RSSI for this lock address, best first.
+     * Falls back to all alive proxies if no fresh RSSI data exists.
      */
     _getRankedProxies(address) {
         const now = Date.now();
         const isAlive = (p) => now - p.lastSeen < PROXY_TIMEOUT_MS;
 
-        const rssiEntries = (this.lockRssiMap.get(address) || [])
+        const entries = (this.lockRssiMap.get(address) || [])
             .filter(e => now - e.lastSeen < RSSI_STALENESS_MS)
             .sort((a, b) => b.rssi - a.rssi);
 
-        if (rssiEntries.length > 0) {
-            const ranked = rssiEntries
+        if (entries.length > 0) {
+            const ranked = entries
                 .map(e => this.proxies.find(p => p.id === e.proxyId))
                 .filter(p => p && isAlive(p));
             if (ranked.length > 0) return ranked;
         }
 
-        // No fresh RSSI data — all alive proxies, owner first
-        const ownerProxyId = this.lockOwnerMap.get(address);
-        return this.proxies
-            .filter(isAlive)
-            .sort((a, b) => {
-                if (a.id === ownerProxyId) return -1;
-                if (b.id === ownerProxyId) return 1;
-                return 0;
-            });
+        // No fresh RSSI data — return all alive proxies
+        return this.proxies.filter(isAlive);
     }
 
-    /**
-     * Get the RSSI value a proxy last reported for a lock.
-     */
+    /** Get the RSSI a proxy last reported for a lock, or null */
     _getRssi(address, proxyId) {
-        const entries = this.lockRssiMap.get(address) || [];
-        const entry = entries.find(e => e.proxyId === proxyId);
+        const entry = (this.lockRssiMap.get(address) || []).find(e => e.proxyId === proxyId);
         return entry ? entry.rssi : null;
     }
 
     /**
-     * Get the lock object that belongs to a specific proxy's scanner.
-     *
-     * The owning proxy has the object in pairedLocks/newLocks.
-     * A non-owning proxy may also have a lock object if it saw the same device
-     * during monitor mode — we retrieve it from that client's internal state.
-     *
-     * @param {string} address
-     * @param {string} proxyId
-     * @returns {import('ttlock-sdk-js').TTLock|null}
+     * Ask a proxy's TTLockClient for its internal lock object for this address.
+     * Each client maintains its own TTLock instances bound to its scanner.
+     * Returns null if the proxy hasn't seen this lock yet.
      */
-    _getLockForProxy(address, proxyId) {
-        const ownerProxyId = this.lockOwnerMap.get(address);
-
-        // Owning proxy — return the lock object we already track
-        if (proxyId === ownerProxyId) {
-            return this.pairedLocks.get(address) || this.newLocks.get(address) || null;
-        }
-
-        // Non-owning proxy — ask its TTLockClient for any lock it has seen
-        const proxy = this.proxies.find(p => p.id === proxyId);
-        if (!proxy) return null;
-
-        // TTLockClient API: try common shapes for accessing its internal lock list
-        if (typeof proxy.client.getLocks === "function") {
-            const locks = proxy.client.getLocks();
+    _getProxyLock(proxy, address) {
+        const client = proxy.client;
+        // Try the public API first
+        if (typeof client.getLocks === "function") {
+            const locks = client.getLocks();
             return locks.find(l => l.getAddress() === address) || null;
         }
-        if (proxy.client.pairedLocks instanceof Map) {
-            return proxy.client.pairedLocks.get(address) || null;
+        // Fallback: internal map (may vary by SDK version)
+        if (client.pairedLocks instanceof Map) {
+            return client.pairedLocks.get(address) || null;
         }
-
         return null;
     }
 
     /**
-     * Transfer ownership of a lock to a new proxy after a successful connect
-     * through a non-owning proxy.
-     * @param {string} address
-     * @param {import('ttlock-sdk-js').TTLock} newLock  - the new proxy's lock object
-     * @param {string} newProxyId
+     * When a different proxy's lock object successfully connected, update our
+     * canonical pairedLocks reference and rebind events to the new object.
      */
-    _migrateOwnership(address, newLock, newProxyId) {
-        const oldLock = this.pairedLocks.get(address);
-        if (oldLock) {
-            oldLock.removeAllListeners();
+    _transferCanonical(address, newLock) {
+        const old = this.pairedLocks.get(address);
+        if (old) {
+            old.removeAllListeners();
             this._bindLockEvents(newLock);
             this.pairedLocks.set(address, newLock);
+            console.log(`[Manager] Canonical lock object updated for ${address}`);
         }
-        this.lockOwnerMap.set(address, newProxyId);
     }
 
     /**
-     * Generic helper: connect + run action + handle errors.
-     * Re-fetches the lock from pairedLocks after connect in case ownership migrated.
+     * Generic helper: get lock, connect, run action, return result.
+     * Re-fetches canonical lock after connect in case _transferCanonical ran.
      */
     async _withLock(address, action) {
         const lock = this.pairedLocks.get(address);
         if (!lock) return false;
         if (!(await this._connectLock(lock))) return false;
         try {
-            // Re-fetch in case _connectLock migrated ownership to a different proxy
-            const currentLock = this.pairedLocks.get(address);
-            return await action(currentLock);
+            return await action(this.pairedLocks.get(address)); // re-fetch in case transferred
         } catch (error) {
             console.error(error);
             return false;
@@ -608,13 +587,11 @@ class Manager extends EventEmitter {
     }
 
     // ---------------------------------------------------------------------------
-    // RSSI tracking
+    // RSSI tracking (ephemeral — never persisted)
     // ---------------------------------------------------------------------------
 
     _updateRssi(proxyId, address, rssi) {
-        if (!this.lockRssiMap.has(address)) {
-            this.lockRssiMap.set(address, []);
-        }
+        if (!this.lockRssiMap.has(address)) this.lockRssiMap.set(address, []);
         const entries = this.lockRssiMap.get(address);
         const existing = entries.find(e => e.proxyId === proxyId);
         if (existing) {
@@ -662,26 +639,29 @@ class Manager extends EventEmitter {
             }
         }
         this.emit("scanStop");
-        setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 200);
+        // Don't restart monitor if new locks are waiting to be paired
+        if (this.newLocks.size === 0) {
+            setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 200);
+        } else {
+            console.log("New locks pending pairing — not restarting monitor");
+        }
     }
 
     /**
      * Called when any proxy finds a lock during scan or monitor.
-     * @param {import('ttlock-sdk-js').TTLock} lock
-     * @param {string} proxyId  - which proxy found this lock
+     * RSSI has already been recorded before this is called (in init()).
+     *
+     * @param {import('ttlock-sdk-js').TTLock} lock  - the proxy's lock object
+     * @param {string} proxyId
      */
     async _onFoundLock(lock, proxyId) {
         const address = lock.getAddress();
-
-        // Always update RSSI — this is the core data for routing decisions
-        this._updateRssi(proxyId, address, lock.rssi);
-
         let listChanged = false;
 
         if (lock.isPaired()) {
             if (!this.pairedLocks.has(address)) {
-                // First sighting of this paired lock — record ownership
-                this.lockOwnerMap.set(address, proxyId);
+                // First sighting — add to shared pool and bind events
+                this.pairedLocks.set(address, lock);
                 this._bindLockEvents(lock);
                 console.log(`Discovered paired lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
 
@@ -700,44 +680,65 @@ class Manager extends EventEmitter {
                     this.connectQueue.add(address);
                 }
                 listChanged = true;
-
             } else {
-                // Already known — log that another proxy can also see it (useful for debugging)
-                const ownerProxy = this.lockOwnerMap.get(address);
-                if (proxyId !== ownerProxy) {
-                    console.log(`Lock ${address} also seen by proxy [${proxyId}] rssi=${lock.rssi} (owner: [${ownerProxy}])`);
+                // Already known — RSSI already updated, nothing else to do
+                if (proxyId !== this._getBestProxyId(address)) {
+                    console.log(`Lock ${address} also seen by [${proxyId}] rssi=${lock.rssi}`);
                 }
             }
 
         } else if (!lock.isInitialized()) {
             if (!this.newLocks.has(address)) {
-                this.lockOwnerMap.set(address, proxyId);
                 console.log(`Discovered new lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
                 this.newLocks.set(address, lock);
                 listChanged = true;
-                if (this.proxies.some(p => p.client.isScanning())) {
-                    console.log("New lock found, stopping scan");
-                    await this.stopScan();
+                // Stop all scanning/monitoring so the lock stays connectable for pairing
+                for (const p of this.proxies) {
+                    try { await p.client.stopScanLock(); } catch (_) { }
+                    try { await p.client.stopMonitor(); } catch (_) { }
                 }
+                console.log("New lock found — all scanning stopped, waiting for user to pair");
             }
+            // Already in newLocks — do nothing, wait for user action
         } else {
             try {
                 console.log("Discovered unknown lock:", lock.toJSON());
             } catch (e) {
-                console.log("Discovered unknown lock:", lock.getAddress(), "(toJSON failed - circular ref)");
+                console.log("Discovered unknown lock:", address, "(toJSON circular ref)");
             }
         }
 
-        if (listChanged) {
-            this.emit("lockListChanged");
+        if (listChanged) this.emit("lockListChanged");
+    }
+
+    /**
+     * Save lock data — flat array, same format as original.
+     * All proxy clients share the same lock data so we only need one client's copy.
+     * Deduplication ensures no duplicates if multiple proxies report the same lock.
+     */
+    async _onUpdatedLockData() {
+        if (this.proxies.length === 0) return;
+        // Use the first proxy's lock data as the canonical source — all proxies
+        // should have the same data since they share the same setLockData() calls.
+        const lockData = this.proxies[0].client.getLockData();
+        store.setLockData(lockData);
+        // Keep all other proxy clients in sync
+        for (let i = 1; i < this.proxies.length; i++) {
+            this.proxies[i].client.setLockData(lockData);
         }
     }
 
-    async _onUpdatedLockData() {
-        const lockData = [];
-        this.proxies.forEach(p => lockData.push(p.client.getLockData()));
-        store.setLockData(lockData);
+    /** Returns the proxyId with the best current RSSI for a lock */
+    _getBestProxyId(address) {
+        const entries = (this.lockRssiMap.get(address) || [])
+            .filter(e => Date.now() - e.lastSeen < RSSI_STALENESS_MS)
+            .sort((a, b) => b.rssi - a.rssi);
+        return entries.length > 0 ? entries[0].proxyId : null;
     }
+
+    // ---------------------------------------------------------------------------
+    // Lock events
+    // ---------------------------------------------------------------------------
 
     _bindLockEvents(lock) {
         lock.on("connected", this._onLockConnected.bind(this));
@@ -762,7 +763,8 @@ class Manager extends EventEmitter {
 
     async _onLockDisconnected(lock) {
         console.log("Disconnected from lock", lock.getAddress());
-        if (lock.isPaired()) {
+        // Only resume monitoring if no new locks are waiting to be paired
+        if (lock.isPaired() && this.newLocks.size === 0) {
             this.proxies.forEach(p => p.client.startMonitor());
         }
     }
