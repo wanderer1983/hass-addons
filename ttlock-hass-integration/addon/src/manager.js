@@ -95,17 +95,18 @@ class Manager extends EventEmitter {
                     : ["local"];
 
                 const keys = this.gateway_key.split(',').map(k => k.trim());
-
+                const ports = this.gateway_port.split(',').map(k => k.trim());
                 for (let i = 0; i < hosts.length; i++) {
                     const host = hosts[i];
                     const key = keys[i] || keys[0] || this.gateway_key; // fallback to first key if not enough keys
+                    const port = ports[i] || ports[0] || this.gateway_key; // fallback to first port if not enough keys
 
                     let clientOptions = {};
                     if (this.gateway === "noble") {
                         clientOptions.scannerType = "noble-websocket";
                         clientOptions.scannerOptions = {
                             websocketHost: host,
-                            websocketPort: this.gateway_port,
+                            websocketPort: port,
                             websocketAesKey: key,          // <-- per-proxy key
                             websocketUsername: this.gateway_user,
                             websocketPassword: this.gateway_pass
