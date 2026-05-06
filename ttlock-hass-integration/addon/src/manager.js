@@ -6,6 +6,7 @@ const { TTLockClient, AudioManage, LockedStatus, LogOperateCategory, LogOperateN
 
 const RSSI_STALENESS_MS = 120_000; // drop RSSI reading after 2 minutes
 const PROXY_TIMEOUT_MS = 60_000; // proxy considered dead after 60s no activity
+const COMMAND_TIMEOUT_MS = 120_000; // give up waiting for lock to wake after 2 minutes
 
 /**
  * Sleep for ms milliseconds
@@ -18,27 +19,36 @@ async function sleep(ms) {
 /**
  * Architecture:
  *
- * - ONE shared flat lock list (pairedLocks / newLocks) — same format as original,
- *   saved/loaded to lockData.json exactly as before.
+ * TTLock devices are battery-powered and sleep between uses. They cannot be
+ * woken remotely — they only accept BLE connections when they are awake
+ * (after physical interaction like touching the keypad).
  *
- * - Each TTLockClient (proxy) gets the full lock list on startup so it can
- *   recognise and decrypt advertisements from any lock.
+ * Strategy:
+ * - Monitor mode runs continuously on all proxies, listening for advertisements
+ * - When a command is needed (lock/unlock/credentials), it is placed in a
+ *   per-lock command queue with a Promise that resolves when executed
+ * - When the lock wakes up and advertises, _onFoundLock fires, sees the pending
+ *   command, connects and executes it
+ * - If the lock doesn't wake within COMMAND_TIMEOUT_MS, the promise resolves false
  *
- * - An ephemeral RSSI table (never saved) tracks signal strength per lock per proxy.
- *   Updated whenever any proxy sees a lock advertisement.
+ * Battery level is broadcast in every advertisement — updated passively without
+ * ever needing a BLE connection.
  *
- * - When a command needs to be sent to a lock, the proxy with the strongest
- *   recent RSSI for that lock is chosen. If it fails, the next-best is tried.
+ * Lock data is stored as a flat array (same format as original).
+ * RSSI table is ephemeral — never saved.
  *
- * - Lock objects: the SDK binds a TTLock object to the scanner that created it,
- *   so each proxy maintains its own TTLock instances internally. We keep ONE
- *   canonical TTLock per address in pairedLocks (the one from the first proxy
- *   that found it) for event binding and state, but when connecting we ask the
- *   best-proxy's client for its version of the lock.
- *
- * Events:
- * - lockListChanged, lockPaired, lockConnected, lockLock, lockUnlock,
- *   lockUpdated, scanStart, scanStop
+ * Events emitted:
+ * - lockListChanged      - lock list changed
+ * - lockDiscovered       - paired lock seen for first time (use for HA config)
+ * - lockPaired           - new lock successfully paired
+ * - lockConnected        - connection established
+ * - lockLock             - lock was locked
+ * - lockUnlock           - lock was unlocked
+ * - lockUpdated          - lock settings changed
+ * - lockBatteryUpdated   - battery level updated (from advertisement, no connection needed)
+ * - lockWaiting          - command queued, waiting for lock to wake
+ * - scanStart            - BLE scan started
+ * - scanStop             - BLE scan stopped
  */
 class Manager extends EventEmitter {
     constructor() {
@@ -57,8 +67,7 @@ class Manager extends EventEmitter {
         this.scanTimer = undefined;
 
         /**
-         * Canonical paired lock objects — ONE per address, same as original.
-         * Saved/loaded via store exactly as before.
+         * Canonical paired lock objects — ONE per address, flat, same as original.
          * @type {Map<string, import('ttlock-sdk-js').TTLock>}
          */
         this.pairedLocks = new Map();
@@ -78,10 +87,16 @@ class Manager extends EventEmitter {
         /**
          * EPHEMERAL — never saved.
          * RSSI table: lockAddress -> Array<{ proxyId, rssi, lastSeen }>
-         * Updated on every advertisement from every proxy.
          * @type {Map<string, Array<{ proxyId: string, rssi: number, lastSeen: number }>>}
          */
         this.lockRssiMap = new Map();
+
+        /**
+         * Per-lock command queue.
+         * Only ONE pending command per lock at a time (new command replaces old).
+         * @type {Map<string, { action: Function, resolve: Function, reject: Function, timer: NodeJS.Timeout, description: string }>}
+         */
+        this.commandQueue = new Map();
 
         /**
          * Prevents concurrent connect attempts to the same lock.
@@ -108,15 +123,10 @@ class Manager extends EventEmitter {
                     ? this.gateway_host.split(',').map(h => h.trim()).filter(Boolean)
                     : ["local"];
 
-                // Support per-proxy AES keys: gateway_key can be comma-separated.
-                // If fewer keys than hosts, the last key is reused.
+                // Per-proxy AES keys: comma-separated, matched by index, last key reused if fewer
                 const keys = this.gateway_key.split(',').map(k => k.trim()).filter(Boolean);
                 const keyFor = (i) => keys[i] || keys[keys.length - 1] || "";
 
-                const ports = this.gateway_port.split(',').map(k => k.trim());
-                const portFor = (i) => ports[i] || ports[ports.length - 1] || "";
-
-                // The shared lock data from store — fed to every proxy client
                 const lockData = store.getLockData();
 
                 for (let i = 0; i < hosts.length; i++) {
@@ -126,7 +136,7 @@ class Manager extends EventEmitter {
                         clientOptions.scannerType = "noble-websocket";
                         clientOptions.scannerOptions = {
                             websocketHost: host,
-                            websocketPort: portFor(i),
+                            websocketPort: this.gateway_port,
                             websocketAesKey: keyFor(i),
                             websocketUsername: this.gateway_user,
                             websocketPassword: this.gateway_pass
@@ -138,7 +148,6 @@ class Manager extends EventEmitter {
                     const proxy = { id: proxyId, client, lastSeen: Date.now() };
                     this.proxies.push(proxy);
 
-                    // Give every proxy the full shared lock list
                     client.setLockData(lockData);
 
                     client.on("ready", () => {
@@ -174,10 +183,6 @@ class Manager extends EventEmitter {
         }
     }
 
-    /**
-     * Push the shared lock list to all proxy clients.
-     * Called after store is updated externally (e.g. config import).
-     */
     updateClientLockDataFromStore() {
         const lockData = store.getLockData();
         this.proxies.forEach(p => p.client.setLockData(lockData));
@@ -197,24 +202,24 @@ class Manager extends EventEmitter {
     getPairedVisible() { return this.pairedLocks; }
     getNewVisible() { return this.newLocks; }
 
-    /** Proxy/RSSI debug info */
     getProxyStatus() {
         const now = Date.now();
-        const proxies = this.proxies.map(p => ({
-            id: p.id,
-            alive: now - p.lastSeen < PROXY_TIMEOUT_MS,
-            lastSeenMs: now - p.lastSeen
-        }));
-        const locks = {};
-        for (const [addr, entries] of this.lockRssiMap) {
-            locks[addr] = entries.map(e => ({
-                proxyId: e.proxyId,
-                rssi: e.rssi,
-                staleMs: now - e.lastSeen,
-                fresh: now - e.lastSeen < RSSI_STALENESS_MS
-            }));
-        }
-        return { proxies, locks };
+        return {
+            proxies: this.proxies.map(p => ({
+                id: p.id,
+                alive: now - p.lastSeen < PROXY_TIMEOUT_MS,
+                lastSeenMs: now - p.lastSeen
+            })),
+            locks: Object.fromEntries(
+                [...this.lockRssiMap].map(([addr, entries]) => [addr, entries.map(e => ({
+                    proxyId: e.proxyId,
+                    rssi: e.rssi,
+                    staleMs: now - e.lastSeen,
+                    fresh: now - e.lastSeen < RSSI_STALENESS_MS
+                }))])
+            ),
+            pendingCommands: [...this.commandQueue.keys()]
+        };
     }
 
     // ---------------------------------------------------------------------------
@@ -246,6 +251,70 @@ class Manager extends EventEmitter {
     }
 
     // ---------------------------------------------------------------------------
+    // Command queue
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Enqueue an action for a lock. Returns a Promise that resolves when the
+     * action executes (after the lock wakes) or resolves false on timeout.
+     *
+     * @param {string} address
+     * @param {string} description
+     * @param {(lock: import('ttlock-sdk-js').TTLock) => Promise<any>} action
+     * @returns {Promise<any>}
+     */
+    _enqueueCommand(address, description, action) {
+        const lock = this.pairedLocks.get(address);
+        if (!lock) return Promise.resolve(false);
+
+        // If already connected, run immediately
+        if (lock.isConnected()) {
+            console.log(`[Queue] Lock ${address} already connected, running "${description}" immediately`);
+            return action(lock).catch(err => { console.error(err); return false; });
+        }
+
+        // Cancel any existing pending command for this lock
+        this._cancelCommand(address, "replaced by newer command");
+
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                this.commandQueue.delete(address);
+                console.warn(`[Queue] "${description}" for ${address} timed out — lock did not wake within ${COMMAND_TIMEOUT_MS / 1000}s`);
+                resolve(false);
+            }, COMMAND_TIMEOUT_MS);
+
+            this.commandQueue.set(address, { action, resolve, timer, description });
+            console.log(`[Queue] Enqueued "${description}" for ${address} — touch keypad to wake lock`);
+            this.emit("lockWaiting", lock);
+        });
+    }
+
+    _cancelCommand(address, reason = "cancelled") {
+        const pending = this.commandQueue.get(address);
+        if (pending) {
+            clearTimeout(pending.timer);
+            console.log(`[Queue] "${pending.description}" for ${address} ${reason}`);
+            pending.resolve(false);
+            this.commandQueue.delete(address);
+        }
+    }
+
+    async _drainQueue(address, lock) {
+        const pending = this.commandQueue.get(address);
+        if (!pending) return;
+        this.commandQueue.delete(address);
+        clearTimeout(pending.timer);
+        console.log(`[Queue] Executing "${pending.description}" for ${address}`);
+        try {
+            const result = await pending.action(lock);
+            pending.resolve(result);
+        } catch (error) {
+            console.error(`[Queue] Error in "${pending.description}" for ${address}:`, error);
+            pending.resolve(false);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Lock operations
     // ---------------------------------------------------------------------------
 
@@ -269,15 +338,15 @@ class Manager extends EventEmitter {
     }
 
     async unlockLock(address) {
-        return this._withLock(address, lock => lock.unlock());
+        return this._enqueueCommand(address, "unlock", lock => lock.unlock());
     }
 
     async lockLock(address) {
-        return this._withLock(address, lock => lock.lock());
+        return this._enqueueCommand(address, "lock", lock => lock.lock());
     }
 
     async setAutoLock(address, value) {
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "setAutoLock", async (lock) => {
             const res = await lock.setAutoLockTime(value);
             this.emit("lockUpdated", lock);
             return res;
@@ -285,37 +354,41 @@ class Manager extends EventEmitter {
     }
 
     async getCredentials(address) {
-        const [passcodes, cards, fingers] = await Promise.all([
-            this.getPasscodes(address),
-            this.getCards(address),
-            this.getFingers(address)
-        ]);
-        return { passcodes, cards, fingers };
+        return this._enqueueCommand(address, "getCredentials", async (lock) => {
+            const [passcodes, cards, fingers] = await Promise.all([
+                lock.hasPassCode() ? lock.getPassCodes() : Promise.resolve([]),
+                lock.hasICCard() ? lock.getICCards() : Promise.resolve([]),
+                lock.hasFingerprint() ? lock.getFingerprints() : Promise.resolve([])
+            ]);
+            for (const card of cards) card.alias = store.getCardAlias(card.cardNumber);
+            for (const finger of fingers) finger.alias = store.getFingerAlias(finger.fpNumber);
+            return { passcodes, cards, fingers };
+        });
     }
 
     async addPasscode(address, type, passCode, startDate, endDate) {
         if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
-        return this._withLock(address, lock => lock.addPassCode(type, passCode, startDate, endDate));
+        return this._enqueueCommand(address, "addPasscode", lock => lock.addPassCode(type, passCode, startDate, endDate));
     }
 
     async updatePasscode(address, type, oldPasscode, newPasscode, startDate, endDate) {
         if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
-        return this._withLock(address, lock => lock.updatePassCode(type, oldPasscode, newPasscode, startDate, endDate));
+        return this._enqueueCommand(address, "updatePasscode", lock => lock.updatePassCode(type, oldPasscode, newPasscode, startDate, endDate));
     }
 
     async deletePasscode(address, type, passCode) {
         if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
-        return this._withLock(address, lock => lock.deletePassCode(type, passCode));
+        return this._enqueueCommand(address, "deletePasscode", lock => lock.deletePassCode(type, passCode));
     }
 
     async getPasscodes(address) {
         if (!this.pairedLocks.get(address)?.hasPassCode()) return false;
-        return this._withLock(address, lock => lock.getPassCodes());
+        return this._enqueueCommand(address, "getPasscodes", lock => lock.getPassCodes());
     }
 
     async addCard(address, startDate, endDate, alias) {
         if (!this.pairedLocks.get(address)?.hasICCard()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "addCard", async (lock) => {
             const card = await lock.addICCard(startDate, endDate);
             store.setCardAlias(card, alias);
             return card;
@@ -324,7 +397,7 @@ class Manager extends EventEmitter {
 
     async updateCard(address, card, startDate, endDate, alias) {
         if (!this.pairedLocks.get(address)?.hasICCard()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "updateCard", async (lock) => {
             const result = await lock.updateICCard(card, startDate, endDate);
             store.setCardAlias(card, alias);
             return result;
@@ -333,7 +406,7 @@ class Manager extends EventEmitter {
 
     async deleteCard(address, card) {
         if (!this.pairedLocks.get(address)?.hasICCard()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "deleteCard", async (lock) => {
             const result = await lock.deleteICCard(card);
             store.deleteCardAlias(card);
             return result;
@@ -342,7 +415,7 @@ class Manager extends EventEmitter {
 
     async getCards(address) {
         if (!this.pairedLocks.get(address)?.hasICCard()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "getCards", async (lock) => {
             const cards = await lock.getICCards();
             for (const card of cards) card.alias = store.getCardAlias(card.cardNumber);
             return cards;
@@ -351,7 +424,7 @@ class Manager extends EventEmitter {
 
     async addFinger(address, startDate, endDate, alias) {
         if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "addFinger", async (lock) => {
             const finger = await lock.addFingerprint(startDate, endDate);
             store.setFingerAlias(finger, alias);
             return finger;
@@ -360,7 +433,7 @@ class Manager extends EventEmitter {
 
     async updateFinger(address, finger, startDate, endDate, alias) {
         if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "updateFinger", async (lock) => {
             const result = await lock.updateFingerprint(finger, startDate, endDate);
             store.setFingerAlias(finger, alias);
             return result;
@@ -369,7 +442,7 @@ class Manager extends EventEmitter {
 
     async deleteFinger(address, finger) {
         if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "deleteFinger", async (lock) => {
             const result = await lock.deleteFingerprint(finger);
             store.deleteFingerAlias(finger);
             return result;
@@ -378,7 +451,7 @@ class Manager extends EventEmitter {
 
     async getFingers(address) {
         if (!this.pairedLocks.get(address)?.hasFingerprint()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "getFingers", async (lock) => {
             const fingers = await lock.getFingerprints();
             for (const f of fingers) f.alias = store.getFingerAlias(f.fpNumber);
             return fingers;
@@ -387,7 +460,7 @@ class Manager extends EventEmitter {
 
     async setAudio(address, audio) {
         if (!this.pairedLocks.get(address)?.hasLockSound()) return false;
-        return this._withLock(address, async (lock) => {
+        return this._enqueueCommand(address, "setAudio", async (lock) => {
             const sound = audio ? AudioManage.TURN_ON : AudioManage.TURN_OFF;
             const res = await lock.setLockSound(sound);
             this.emit("lockUpdated", lock);
@@ -396,10 +469,7 @@ class Manager extends EventEmitter {
     }
 
     async getOperationLog(address, reload = false) {
-        const lock = this.pairedLocks.get(address);
-        if (!lock) return false;
-        if (!(await this._connectLock(lock))) return false;
-        try {
+        return this._enqueueCommand(address, "getOperationLog", async (lock) => {
             let operations = JSON.parse(JSON.stringify(await lock.getOperationLog(true, reload)));
             const validOperations = [];
             for (const op of operations) {
@@ -416,17 +486,11 @@ class Manager extends EventEmitter {
                 validOperations.push(op);
             }
             return validOperations;
-        } catch (error) {
-            console.error(error);
-            return false;
-        }
+        });
     }
 
     async resetLock(address) {
-        const lock = this.pairedLocks.get(address);
-        if (!lock) return false;
-        if (!(await this._connectLock(lock))) return false;
-        try {
+        return this._enqueueCommand(address, "resetLock", async (lock) => {
             const res = await lock.resetLock();
             if (res) {
                 lock.removeAllListeners();
@@ -435,36 +499,17 @@ class Manager extends EventEmitter {
                 this.emit("lockListChanged");
             }
             return res;
-        } catch (error) {
-            console.error(error);
-        }
-        return false;
+        });
     }
 
     // ---------------------------------------------------------------------------
-    // Core routing — connect via best proxy by RSSI
+    // Core connect — used internally when lock is known to be awake
     // ---------------------------------------------------------------------------
 
-    /**
-     * Connect to a lock using the proxy with the strongest recent RSSI.
-     * Falls back through ranked proxies until one succeeds.
-     *
-     * Each proxy client has its own internal TTLock instance for the same
-     * physical lock (because the SDK binds lock objects to their scanner).
-     * We ask each proxy's client for its version of the lock and attempt
-     * to connect through it.
-     *
-     * @param {import('ttlock-sdk-js').TTLock} lock  canonical lock object
-     * @param {boolean} readData
-     * @returns {Promise<boolean>}
-     */
     async _connectLock(lock, readData = true) {
-        if (this.scanning) return false;
         if (lock.isConnected()) return true;
 
         const address = lock.getAddress();
-
-        // Prevent concurrent connect attempts for the same lock
         if (this._connecting.has(address)) {
             console.log(`[Manager] Connect already in progress for ${address}, skipping`);
             return false;
@@ -479,19 +524,14 @@ class Manager extends EventEmitter {
             }
 
             for (const proxy of ranked) {
-                // Get this proxy's internal lock object for this address
                 const proxyLock = this._getProxyLock(proxy, address) || lock;
-
                 try {
                     const rssi = this._getRssi(address, proxy.id);
-                    console.log(`[Manager] Attempting connect to ${address} via [${proxy.id}] rssi=${rssi}`);
+                    console.log(`[Manager] Connecting to ${address} via [${proxy.id}] rssi=${rssi}`);
+                    await sleep(300); // give adapter time to settle after monitor stop
                     const res = await proxyLock.connect(!readData);
                     if (res) {
-                        // If we connected via a different proxy's lock object, update
-                        // our canonical reference so subsequent calls use the right object
-                        if (proxyLock !== lock) {
-                            this._transferCanonical(address, proxyLock);
-                        }
+                        if (proxyLock !== lock) this._transferCanonical(address, proxyLock);
                         console.log(`[Manager] Connected to ${address} via [${proxy.id}]`);
                         return true;
                     }
@@ -508,98 +548,52 @@ class Manager extends EventEmitter {
         }
     }
 
-    /**
-     * Returns proxies sorted by RSSI for this lock address, best first.
-     * Falls back to all alive proxies if no fresh RSSI data exists.
-     */
     _getRankedProxies(address) {
         const now = Date.now();
         const isAlive = (p) => now - p.lastSeen < PROXY_TIMEOUT_MS;
-
         const entries = (this.lockRssiMap.get(address) || [])
             .filter(e => now - e.lastSeen < RSSI_STALENESS_MS)
             .sort((a, b) => b.rssi - a.rssi);
-
         if (entries.length > 0) {
-            const ranked = entries
-                .map(e => this.proxies.find(p => p.id === e.proxyId))
-                .filter(p => p && isAlive(p));
+            const ranked = entries.map(e => this.proxies.find(p => p.id === e.proxyId)).filter(p => p && isAlive(p));
             if (ranked.length > 0) return ranked;
         }
-
-        // No fresh RSSI data — return all alive proxies
         return this.proxies.filter(isAlive);
     }
 
-    /** Get the RSSI a proxy last reported for a lock, or null */
     _getRssi(address, proxyId) {
         const entry = (this.lockRssiMap.get(address) || []).find(e => e.proxyId === proxyId);
         return entry ? entry.rssi : null;
     }
 
-    /**
-     * Ask a proxy's TTLockClient for its internal lock object for this address.
-     * Each client maintains its own TTLock instances bound to its scanner.
-     * Returns null if the proxy hasn't seen this lock yet.
-     */
     _getProxyLock(proxy, address) {
         const client = proxy.client;
-        // Try the public API first
         if (typeof client.getLocks === "function") {
-            const locks = client.getLocks();
-            return locks.find(l => l.getAddress() === address) || null;
+            return client.getLocks().find(l => l.getAddress() === address) || null;
         }
-        // Fallback: internal map (may vary by SDK version)
-        if (client.pairedLocks instanceof Map) {
-            return client.pairedLocks.get(address) || null;
-        }
+        if (client.pairedLocks instanceof Map) return client.pairedLocks.get(address) || null;
         return null;
     }
 
-    /**
-     * When a different proxy's lock object successfully connected, update our
-     * canonical pairedLocks reference and rebind events to the new object.
-     */
     _transferCanonical(address, newLock) {
         const old = this.pairedLocks.get(address);
         if (old) {
             old.removeAllListeners();
             this._bindLockEvents(newLock);
             this.pairedLocks.set(address, newLock);
-            console.log(`[Manager] Canonical lock object updated for ${address}`);
-        }
-    }
-
-    /**
-     * Generic helper: get lock, connect, run action, return result.
-     * Re-fetches canonical lock after connect in case _transferCanonical ran.
-     */
-    async _withLock(address, action) {
-        const lock = this.pairedLocks.get(address);
-        if (!lock) return false;
-        if (!(await this._connectLock(lock))) return false;
-        try {
-            return await action(this.pairedLocks.get(address)); // re-fetch in case transferred
-        } catch (error) {
-            console.error(error);
-            return false;
         }
     }
 
     // ---------------------------------------------------------------------------
-    // RSSI tracking (ephemeral — never persisted)
+    // RSSI tracking
     // ---------------------------------------------------------------------------
 
     _updateRssi(proxyId, address, rssi) {
         if (!this.lockRssiMap.has(address)) this.lockRssiMap.set(address, []);
         const entries = this.lockRssiMap.get(address);
         const existing = entries.find(e => e.proxyId === proxyId);
-        if (existing) {
-            existing.rssi = rssi;
-            existing.lastSeen = Date.now();
-        } else {
-            entries.push({ proxyId, rssi, lastSeen: Date.now() });
-        }
+        if (existing) { existing.rssi = rssi; existing.lastSeen = Date.now(); }
+        else entries.push({ proxyId, rssi, lastSeen: Date.now() });
     }
 
     _pruneStaleRssi() {
@@ -609,6 +603,23 @@ class Manager extends EventEmitter {
             if (fresh.length === 0) this.lockRssiMap.delete(addr);
             else this.lockRssiMap.set(addr, fresh);
         }
+    }
+
+    /**
+     * Get the battery level from a lock object, trying multiple API shapes
+     * since different SDK versions expose it differently.
+     * @param {import('ttlock-sdk-js').TTLock} lock
+     * @returns {number|null}
+     */
+    _getBattery(lock) {
+        if (typeof lock.getBattery === "function") {
+            const b = lock.getBattery();
+            if (b !== null && b !== undefined && b >= 0) return b;
+        }
+        if (typeof lock.batteryCapacity === "number" && lock.batteryCapacity >= 0) {
+            return lock.batteryCapacity;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------------------
@@ -623,25 +634,10 @@ class Manager extends EventEmitter {
 
     async _onScanStopped() {
         this.scanning = false;
-        console.log("BLE Scan stopped — refreshing paired locks");
-        for (const address of this.connectQueue) {
-            if (this.pairedLocks.has(address)) {
-                const lock = this.pairedLocks.get(address);
-                console.log("Auto connect to", address);
-                const result = await lock.connect();
-                if (result === true) {
-                    await lock.disconnect();
-                    console.log("Successful connect attempt to paired lock", address);
-                    this.connectQueue.delete(address);
-                } else {
-                    console.log("Unsuccessful connect attempt to paired lock", address);
-                }
-            }
-        }
+        console.log("BLE Scan stopped");
         this.emit("scanStop");
-        // Don't restart monitor if new locks are waiting to be paired
         if (this.newLocks.size === 0) {
-            setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 200);
+            setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 500);
         } else {
             console.log("New locks pending pairing — not restarting monitor");
         }
@@ -649,9 +645,13 @@ class Manager extends EventEmitter {
 
     /**
      * Called when any proxy finds a lock during scan or monitor.
-     * RSSI has already been recorded before this is called (in init()).
      *
-     * @param {import('ttlock-sdk-js').TTLock} lock  - the proxy's lock object
+     * Key responsibilities:
+     * 1. Update battery passively from advertisement data (no connection needed)
+     * 2. If lock has a pending command, connect and execute it
+     * 3. If lock has new events (used physically), connect and read log
+     *
+     * @param {import('ttlock-sdk-js').TTLock} lock
      * @param {string} proxyId
      */
     async _onFoundLock(lock, proxyId) {
@@ -659,31 +659,66 @@ class Manager extends EventEmitter {
         let listChanged = false;
 
         if (lock.isPaired()) {
-            if (!this.pairedLocks.has(address)) {
-                // First sighting — add to shared pool and bind events
+            const isNewToPool = !this.pairedLocks.has(address);
+
+            if (isNewToPool) {
+                // First sighting of this paired lock — add to shared pool
                 this.pairedLocks.set(address, lock);
                 this._bindLockEvents(lock);
                 console.log(`Discovered paired lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
-
-                const anyMonitoring = this.proxies.some(p => p.client.isMonitoring());
-                if (anyMonitoring) {
-                    const result = await lock.connect();
-                    if (result === true) {
-                        console.log("Successful connect attempt to paired lock", address);
-                        await this._processOperationLog(lock);
-                    } else {
-                        console.log("Unsuccessful connect attempt to paired lock", address);
-                        this.connectQueue.add(address);
-                    }
-                    await lock.disconnect();
-                } else {
-                    this.connectQueue.add(address);
-                }
                 listChanged = true;
-            } else {
-                // Already known — RSSI already updated, nothing else to do
-                if (proxyId !== this._getBestProxyId(address)) {
-                    console.log(`Lock ${address} also seen by [${proxyId}] rssi=${lock.rssi}`);
+                // Emit lockDiscovered so HA can configure the entity immediately,
+                // without waiting for a BLE connection
+                this.emit("lockDiscovered", lock);
+            }
+
+            // --- Passive battery update from advertisement ---
+            // Battery is encoded in the manufacturer data and decoded by the SDK.
+            // We get a free update on every advertisement without connecting.
+            const canonical = this.pairedLocks.get(address);
+            const battery = this._getBattery(lock);
+            if (battery !== null) {
+                // Propagate to canonical lock object if this came from a different proxy
+                if (lock !== canonical) {
+                    canonical.batteryCapacity = battery;
+                }
+                console.log(`Battery update for ${address}: ${battery}% (via [${proxyId}])`);
+                this.emit("lockBatteryUpdated", canonical);
+            }
+
+            // --- Command queue / event processing ---
+            if (!this._connecting.has(address)) {
+                const hasPendingCommand = this.commandQueue.has(address);
+                const hasNewEvents = lock.hasNewEvents && lock.hasNewEvents();
+
+                if (hasPendingCommand || hasNewEvents) {
+                    const reason = hasPendingCommand ? "pending command" : "new events";
+                    console.log(`Lock ${address} is awake (rssi=${lock.rssi}), processing ${reason}`);
+
+                    // Stop monitor on all proxies before connecting
+                    for (const p of this.proxies) {
+                        try { await p.client.stopMonitor(); } catch (_) { }
+                    }
+                    await sleep(300);
+
+                    const connected = await this._connectLock(canonical);
+                    if (connected) {
+                        const currentLock = this.pairedLocks.get(address);
+                        if (hasPendingCommand) {
+                            await this._drainQueue(address, currentLock);
+                        }
+                        if (hasNewEvents) {
+                            await this._processOperationLog(currentLock);
+                        }
+                        await currentLock.disconnect();
+                    } else {
+                        console.warn(`Connect failed for ${address} despite lock being awake`);
+                    }
+
+                    // Restart monitor after command
+                    if (this.newLocks.size === 0) {
+                        setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 500);
+                    }
                 }
             }
 
@@ -692,14 +727,13 @@ class Manager extends EventEmitter {
                 console.log(`Discovered new lock: ${address} via [${proxyId}] rssi=${lock.rssi}`);
                 this.newLocks.set(address, lock);
                 listChanged = true;
-                // Stop all scanning/monitoring so the lock stays connectable for pairing
+                // Stop everything so the lock stays connectable for pairing
                 for (const p of this.proxies) {
                     try { await p.client.stopScanLock(); } catch (_) { }
                     try { await p.client.stopMonitor(); } catch (_) { }
                 }
                 console.log("New lock found — all scanning stopped, waiting for user to pair");
             }
-            // Already in newLocks — do nothing, wait for user action
         } else {
             try {
                 console.log("Discovered unknown lock:", lock.toJSON());
@@ -714,12 +748,9 @@ class Manager extends EventEmitter {
     /**
      * Save lock data — flat array, same format as original.
      * All proxy clients share the same lock data so we only need one client's copy.
-     * Deduplication ensures no duplicates if multiple proxies report the same lock.
      */
     async _onUpdatedLockData() {
         if (this.proxies.length === 0) return;
-        // Use the first proxy's lock data as the canonical source — all proxies
-        // should have the same data since they share the same setLockData() calls.
         const lockData = this.proxies[0].client.getLockData();
         store.setLockData(lockData);
         // Keep all other proxy clients in sync
@@ -727,18 +758,6 @@ class Manager extends EventEmitter {
             this.proxies[i].client.setLockData(lockData);
         }
     }
-
-    /** Returns the proxyId with the best current RSSI for a lock */
-    _getBestProxyId(address) {
-        const entries = (this.lockRssiMap.get(address) || [])
-            .filter(e => Date.now() - e.lastSeen < RSSI_STALENESS_MS)
-            .sort((a, b) => b.rssi - a.rssi);
-        return entries.length > 0 ? entries[0].proxyId : null;
-    }
-
-    // ---------------------------------------------------------------------------
-    // Lock events
-    // ---------------------------------------------------------------------------
 
     _bindLockEvents(lock) {
         lock.on("connected", this._onLockConnected.bind(this));
@@ -763,9 +782,8 @@ class Manager extends EventEmitter {
 
     async _onLockDisconnected(lock) {
         console.log("Disconnected from lock", lock.getAddress());
-        // Only resume monitoring if no new locks are waiting to be paired
         if (lock.isPaired() && this.newLocks.size === 0) {
-            this.proxies.forEach(p => p.client.startMonitor());
+            setTimeout(() => this.proxies.forEach(p => p.client.startMonitor()), 500);
         }
     }
 
@@ -786,6 +804,8 @@ class Manager extends EventEmitter {
             }
         }
         if (paramsChanged.batteryCapacity === true) {
+            // Battery changed during a connected session — emit both events
+            this.emit("lockBatteryUpdated", lock);
             this.emit("lockUpdated", lock);
         }
         await lock.disconnect();
