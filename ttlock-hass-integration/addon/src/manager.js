@@ -127,6 +127,9 @@ class Manager extends EventEmitter {
                 const keys = this.gateway_key.split(',').map(k => k.trim()).filter(Boolean);
                 const keyFor = (i) => keys[i] || keys[keys.length - 1] || "";
 
+                const ports = this.gateway_port.split(',').map(k => k.trim()).filter(Boolean);
+                const portFor = (i) => ports[i] || ports[ports.length - 1] || "";
+
                 const lockData = store.getLockData();
 
                 for (let i = 0; i < hosts.length; i++) {
@@ -136,7 +139,7 @@ class Manager extends EventEmitter {
                         clientOptions.scannerType = "noble-websocket";
                         clientOptions.scannerOptions = {
                             websocketHost: host,
-                            websocketPort: this.gateway_port,
+                            websocketPort: portFor(i),
                             websocketAesKey: keyFor(i),
                             websocketUsername: this.gateway_user,
                             websocketPassword: this.gateway_pass
